@@ -49,3 +49,8 @@ Thumbs.db
 *.p12
 *.jks
 keystore.properties
+
+# Gradle 项目本地缓存（含被冻结后改名的僵尸目录）
+.gradle/
+.gradle.zombie_*/
+*.frozen_*/

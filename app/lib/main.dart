@@ -54,7 +54,7 @@ void _boot() {
     systemNavigationBarIconBrightness: Brightness.dark,
     systemNavigationBarContrastEnforced: false,
   ));
-  DiagLog.instance.log('BOOT', 'App 启动 (build: onnx-only-ai / 2026-09-18)');
+  DiagLog.instance.logNow('BOOT', 'App 启动 (build: A-720p+perf / 2026-09-18)');
   runApp(const LiveToolboxApp());
 }
 

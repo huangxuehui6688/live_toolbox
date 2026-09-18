@@ -49,6 +49,13 @@ class DiagLog {
     _timer = Timer.periodic(const Duration(seconds: 2), (_) => _flush());
   }
 
+  /// 立即落盘 + 发信标。启动、引擎加载这类"关键节点"用它，
+  /// 避免攒批期间 App 被切后台/被杀导致现场丢掉。
+  void logNow(String tag, String msg) {
+    log(tag, msg);
+    _flush();
+  }
+
   /// 停掉定时刷盘（测试用；正常运行期一直开着）
   void stop() {
     _timer?.cancel();

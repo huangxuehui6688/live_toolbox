@@ -82,6 +82,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   DateTime? _busySince; // 进入 _busy 的时刻（看门狗用）
   int _loadFails = 0; // 引擎"加载"失败次数（比单帧失败严重，2 次即熔断）
 
+  // ===== 耗时剖析（定位"为什么只有 7fps"：每帧各阶段分别烧多少毫秒）=====
+  // 只在每秒结算一次时求平均并进 HUD，本身几乎零开销（6 次 now() + 整数累加）。
+  int _tRgb = 0, _tSample = 0, _tAlpha = 0, _tDecode = 0, _tFrame = 0, _tN = 0;
+  String _perfDbg = '';
+
   // ===== 跨帧复用的缓冲（避免每帧几十 MB 的分配触发 GC 抖动）=====
   Uint8List? _rgbaBuf; // 全分辨率 RGBA
   Uint8List? _aiRgbBuf; // 喂给模型的方形 RGB
@@ -186,10 +191,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (gen != _camGen) return;
       _camera = CameraController(
         cam,
-        // ★画质：720p 铺满全屏（物理高约 2400）要放大约 1.9 倍 → 看着发虚。
-        //   提到 1080p（veryHigh）后放大约 1.2 倍，明显更清晰；
-        //   实景/抠像两态都受益（竞品「原相机就很清楚」主要就差在这里）。
-        ResolutionPreset.veryHigh,
+        // ★A 方案：1080p → 720p。
+        //   代价先说清：720p 铺满全屏（物理高约 2400）要放大 ~1.8 倍，预览会发虚一点。
+        //   换到的是整条管线每秒处理的像素少 2.25 倍 —— 之前实测只有 7fps，
+        //   根因就是三个全分辨率 CPU 遍历 + 一次全屏解码，全按像素数线性烧时间。
+        //   1080p 留着等 B 方案（相机纹理 + 片元着色器采样 alpha）再上，
+        //   那时像素处理搬去 GPU，分辨率就不再是帧率的代价。
+        ResolutionPreset.high,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.nv21,
       );
@@ -375,6 +383,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     }
     _busy = true;
     _busySince = DateTime.now();
+    final tStart = DateTime.now();
+    int msRgb = 0, msSample = 0, msAlpha = 0, msDecode = 0;
     try {
       final w = image.width;
       final h = image.height;
@@ -382,6 +392,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       final nv21 = _yuvPlanesToNv21(image);
       final rgba = _rgbaOf(w, h);
       _nv21ToRgbaInto(nv21, w, h, rgba);
+      msRgb = DateTime.now().difference(tStart).inMilliseconds;
 
       ui.Image? img;
       if (useAi) {
@@ -394,6 +405,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         final rgb = _aiRgbOf(size);
         final rotDeg = (360 - orientation) % 360;
         _sampleSquareRgb(rgba, w, h, rotDeg, size, rgb);
+        msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
 
         // ---- ★★ 出画与推理解耦（不然手机端会掉成幻灯片）★★ ----
         // 反例：如果这里 `await eng.matting(...)`，那么一次推理 200~400ms 期间
@@ -440,14 +452,19 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           // ★alpha 是「转正+裁方」坐标系的，贴回必须做逆变换（同 rotDeg）
           _applySoftAlpha(rgba, a, size, size, widget.strength, w, h, rotDeg);
         }
+        final tA = DateTime.now();
+        msAlpha = tA.difference(tStart).inMilliseconds - msRgb - msSample;
         img = await _decode(rgba, w, h);
+        msDecode = DateTime.now().difference(tA).inMilliseconds;
       } else {
         // 色布模式：只做真·色键；实景模式（不抠像）什么都不做
         if (widget.keyColor >= 0) {
           _applyChromaKey(rgba, w, h, widget.keyColor, widget.strength);
           _premultiply(rgba, w, h);
         }
+        final tA = DateTime.now();
         img = await _decode(rgba, w, h);
+        msDecode = DateTime.now().difference(tA).inMilliseconds;
       }
       if (!mounted || gen != _camGen) {
         img.dispose();
@@ -471,6 +488,22 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
             _aiFps = _aiFrames * 1000 / dt;
             _aiFrames = 0;
             _lastFps = now;
+            // 每秒结算一次耗时分解（本帧也计入）
+            _tRgb += msRgb;
+            _tSample += msSample;
+            _tAlpha += msAlpha;
+            _tDecode += msDecode;
+            _tFrame += now.difference(tStart).inMilliseconds;
+            _tN++;
+            final n = _tN;
+            _perfDbg = '耗时/帧(ms) 转RGBA ${_tRgb ~/ n} · 采样 ${_tSample ~/ n} · '
+                '合成 ${_tAlpha ~/ n} · 解码 ${_tDecode ~/ n} · 合计 ${_tFrame ~/ n}';
+            _tRgb = 0;
+            _tSample = 0;
+            _tAlpha = 0;
+            _tDecode = 0;
+            _tFrame = 0;
+            _tN = 0;
           }
         });
       }
@@ -512,7 +545,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               borderRadius: BorderRadius.circular(12),
             ),
             child: Text(
-              '${_frame == null ? _status : '$_status · ${_fps.toStringAsFixed(0)}fps'}${_maskDbg.isEmpty ? '' : '\n$_maskDbg'}',
+              '${_frame == null ? _status : '$_status · ${_fps.toStringAsFixed(0)}fps'}${_maskDbg.isEmpty ? '' : '\n$_maskDbg'}${_perfDbg.isEmpty ? '' : '\n$_perfDbg'}',
               style: const TextStyle(color: Colors.white, fontSize: 11),
             ),
           ),
