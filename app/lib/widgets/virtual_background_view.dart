@@ -82,6 +82,17 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   DateTime? _busySince; // 进入 _busy 的时刻（看门狗用）
   int _loadFails = 0; // 引擎"加载"失败次数（比单帧失败严重，2 次即熔断）
 
+  // ===== ★B 方案：合成搬到 GPU =====
+  /// true = 相机纹理零拷贝上屏 + alpha 当 ShaderMask 遮罩（GPU 合成）。
+  /// false = 回到"每帧 CPU 全分辨率合成 + decode 全屏图"的老路径（代码原样保留）。
+  static const bool kGpuComposite = true;
+
+  ui.Image? _alphaImg; // 256² alpha 小图（RGBA 白底，只取 alpha 通道当遮罩）
+  bool _alphaImgBusy = false; // 上一张还没建好就跳过（alpha 本身只有 2~4fps）
+  int _alphaSeq = 0;
+  bool _hasFrame = false; // 出过至少一帧（HUD 用它决定显不显示 fps）
+  Size _frameSize = Size.zero; // 相机原始 buffer 尺寸（GPU 层算 cover 比例用）
+
   // ===== 耗时剖析（定位"为什么只有 7fps"：每帧各阶段分别烧多少毫秒）=====
   // 只在每秒结算一次时求平均并进 HUD，本身几乎零开销（6 次 now() + 整数累加）。
   int _tRgb = 0, _tSample = 0, _tAlpha = 0, _tDecode = 0, _tFrame = 0, _tN = 0;
@@ -191,13 +202,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (gen != _camGen) return;
       _camera = CameraController(
         cam,
-        // ★A 方案：1080p → 720p。
-        //   代价先说清：720p 铺满全屏（物理高约 2400）要放大 ~1.8 倍，预览会发虚一点。
-        //   换到的是整条管线每秒处理的像素少 2.25 倍 —— 之前实测只有 7fps，
-        //   根因就是三个全分辨率 CPU 遍历 + 一次全屏解码，全按像素数线性烧时间。
-        //   1080p 留着等 B 方案（相机纹理 + 片元着色器采样 alpha）再上，
-        //   那时像素处理搬去 GPU，分辨率就不再是帧率的代价。
-        ResolutionPreset.high,
+        // ★B 方案已上：合成搬到 GPU（相机纹理 + alpha 遮罩），分辨率不再拖帧率，
+        //   所以这里回到 1080p —— 铺满全屏只需放大 ~1.2 倍，肉眼明显更清晰。
+        //   ⚠️ 万一容器里 Texture 预览与图像流打架（画面卡住/不刷新），
+        //      把 kGpuComposite 置 false 即回到老的 CPU 路径，那时再把这里改回 high。
+        ResolutionPreset.veryHigh,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.nv21,
       );
@@ -309,6 +318,170 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     }
   }
 
+  /// 把 256² 的 alpha 发成一张小 `ui.Image` 交给 GPU 当遮罩。
+  /// 256*256*4 = 256KB（对比原来每帧一张 1080p 大图 ≈ 8MB），而且只有 AI 出新 alpha
+  /// 时才建（2~4 次/秒），对主线程几乎无感。
+  void _publishAlpha(Float32List a, int size) {
+    if (_alphaImgBusy) return;
+    _alphaImgBusy = true;
+    // 预乘白：RGB 与 A 同值，遮罩只看 alpha 通道，颜色无所谓
+    final px = Uint8List(size * size * 4);
+    for (int i = 0, o = 0; i < a.length; i++) {
+      final v = (a[i] * 255.0).clamp(0.0, 255.0).toInt();
+      px[o++] = v;
+      px[o++] = v;
+      px[o++] = v;
+      px[o++] = v;
+    }
+    final seq = ++_alphaSeq;
+    ui.decodeImageFromPixels(px, size, size, ui.PixelFormat.rgba8888, (img) {
+      _alphaImgBusy = false;
+      if (!mounted || seq != _alphaSeq) {
+        img.dispose();
+        return;
+      }
+      final oldA = _alphaImg;
+      setState(() => _alphaImg = img);
+      // ★必须等下一帧画完再释放：本帧的 Picture 可能还引用着旧图
+      if (oldA != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => oldA.dispose());
+      }
+    });
+  }
+
+  /// 遮罩矩阵：把 256² 的 alpha 摆到屏幕上"人像所在的那个方块"。
+  ///
+  /// 模型看到的是「转正后居中裁方」的画面，边长 S = min(转正宽, 转正高)；
+  /// 屏幕上画面按 cover 比例 k 铺满控件，所以那个方块在屏幕上是边长 S*k 的居中正方形。
+  /// 前置还要跟着镜像，否则遮罩和人像左右会差开。
+  Matrix4 _maskMatrix(double viewW, double viewH, int rotDeg, bool mirror,
+      int alphaSize) {
+    final f = _frameSize;
+    if (f.width <= 0 || f.height <= 0 || alphaSize <= 0) return Matrix4.identity();
+    final swap = rotDeg == 90 || rotDeg == 270;
+    final rw = swap ? f.height : f.width; // 转正后的宽
+    final rh = swap ? f.width : f.height; // 转正后的高
+    final k = math.max(viewW / rw, viewH / rh); // cover 比例
+    final s = math.min(rw, rh) * k; // 人像方块在屏幕上的边长
+    // 直接把矩阵写出来（不走 translate/scale 链，精确且无弃用告警）：
+    // 把 alpha 图（alphaSize 见方）线性映射到屏幕上那个居中方块；
+    // 前置镜像时 x 轴反向，原点挪到方块右边缘。
+    final sc = s / alphaSize;
+    final m = Matrix4.identity();
+    m.setEntry(0, 0, mirror ? -sc : sc);
+    m.setEntry(1, 1, sc);
+    m.setEntry(0, 3, mirror ? viewW / 2 + s / 2 : viewW / 2 - s / 2);
+    m.setEntry(1, 3, viewH / 2 - s / 2);
+    return m;
+  }
+
+  /// 相机纹理层：GPU 零拷贝上屏。
+  ///
+  /// 几个已核实的细节（别再改回去）：
+  /// * `CameraController.buildPreview()` 在 Android 上底层就是
+  ///   `Texture(textureId: cameraId)` —— 纯 GPU 纹理，CPU 一点不碰。
+  /// * camera 0.12 的 `buildPreview()` **自己已经处理转正与裁切**
+  ///   （RotatedPreviewDelegate / camerax 原生），所以这里**不能再套 RotatedBox**，
+  ///   否则会转两次。
+  /// * 该插件**不自动镜像前置摄像头** —— 老 CPU 路径是在 `_CompositePainter` 里
+  ///   `canvas.scale(-1, 1)` 翻的。GPU 层必须自己翻，否则画面与 alpha 遮罩左右错开。
+  Widget _cameraTextureLayer(bool mirror) {
+    final cam = _camera;
+    if (cam == null || !cam.value.isInitialized) return const SizedBox.shrink();
+    Widget p = CameraPreview(cam); // 官方预览：已转正、比例正确
+    if (mirror) {
+      p = Transform(
+        alignment: Alignment.center,
+        transform: Matrix4.diagonal3Values(-1.0, 1.0, 1.0),
+        child: p,
+      );
+    }
+    // cover 铺满：给 FittedBox 一个确定尺寸，它才能算缩放（AspectRatio 不能吃无界约束）
+    final f = _frameSize;
+    final rotDeg = (360 - _frameOrientation) % 360;
+    final swap = rotDeg == 90 || rotDeg == 270;
+    final rw = swap ? f.height : f.width;
+    final rh = swap ? f.width : f.height;
+    if (rw <= 0 || rh <= 0) return p;
+    return ClipRect(
+      child: SizedBox.expand(
+        child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(width: rw, height: rh, child: p),
+        ),
+      ),
+    );
+  }
+
+  /// 美颜（与 `_CompositePainter` 里的做法对齐：磨皮=模糊层 + 半透明原图，美白=颜色矩阵）
+  Widget _beauty(Widget child) {
+    final smooth = BeautySettings.smooth.value;
+    final whiten = BeautySettings.whiten.value;
+    if (smooth <= 0 && whiten <= 0) return child;
+    Widget sharp = child;
+    if (whiten > 0) {
+      sharp = ColorFiltered(
+          colorFilter: ColorFilter.matrix(whitenMatrix(whiten)), child: sharp);
+    }
+    if (smooth <= 0) return sharp;
+    final sigma = 0.6 + smooth * 3.0;
+    return Stack(fit: StackFit.expand, children: [
+      ImageFiltered(
+        imageFilter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+        child: child,
+      ),
+      Opacity(opacity: 1 - smooth * 0.55, child: sharp),
+    ]);
+  }
+
+  /// 背景层（等价于 painter 里先铺的那层渐变/场景色）
+  Widget _backgroundLayer() =>
+      DecoratedBox(decoration: BoxDecoration(gradient: widget.background));
+
+  /// ★B：GPU 合成的画面层
+  Widget _gpuComposite() {
+    final rotDeg = (360 - _frameOrientation) % 360;
+    final mirror = widget.mirror && _frameMirror;
+    final person = _beauty(_cameraTextureLayer(mirror));
+    final alpha = _alphaImg;
+    // 实景（不抠像）：纹理直出，CPU 一帧都不用碰
+    if (!_useAi) {
+      return _needBackground
+          ? Stack(fit: StackFit.expand,
+              children: [_backgroundLayer(), person])
+          : person;
+    }
+    // AI 抠像：第一帧 alpha 还没出来时先原样显示（不黑屏），之后上遮罩
+    if (alpha == null) return person;
+    return Stack(fit: StackFit.expand, children: [
+      if (_needBackground) _backgroundLayer(),
+      ShaderMask(
+        blendMode: BlendMode.dstIn,
+        shaderCallback: (Rect bounds) => ui.ImageShader(
+          alpha,
+          TileMode.clamp,
+          TileMode.clamp,
+          _maskMatrix(bounds.width, bounds.height, rotDeg, mirror, alpha.width)
+              .storage,
+        ),
+        child: person,
+      ),
+    ]);
+  }
+
+  /// 老路径（CPU 全分辨率合成）：合成、色布、以及 kGpuComposite=false 时用
+  Widget _cpuComposite() => CustomPaint(
+        painter: _CompositePainter(
+          background: _needBackground ? widget.background : null,
+          frame: _frame,
+          // 镜像与帧绑定（前置镜像、后置不镜像）；切摄像头时旧帧不会被去镜像
+          mirror: widget.mirror && _frameMirror,
+          sensorOrientation: _frameOrientation,
+          smooth: BeautySettings.smooth.value,
+          whiten: BeautySettings.whiten.value,
+        ),
+      );
+
   /// 全分辨率 RGBA 缓冲（跨帧复用，尺寸变了才重建）
   Uint8List _rgbaOf(int w, int h) {
     final need = w * h * 4;
@@ -389,9 +562,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       final w = image.width;
       final h = image.height;
       // camerax 输出的是 YUV_420_888 三平面，需拼接成 NV21 单缓冲（Y + VU 交错）
-      final nv21 = _yuvPlanesToNv21(image);
+      // ★B：GPU 合成时，实景/色布（不跑模型）连 RGBA 都不用转 —— CPU 一帧都不碰
+      final needRgba = useAi || widget.keyColor >= 0 || !kGpuComposite;
       final rgba = _rgbaOf(w, h);
-      _nv21ToRgbaInto(nv21, w, h, rgba);
+      if (needRgba) {
+        final nv21 = _yuvPlanesToNv21(image);
+        _nv21ToRgbaInto(nv21, w, h, rgba);
+      }
       msRgb = DateTime.now().difference(tStart).inMilliseconds;
 
       ui.Image? img;
@@ -436,6 +613,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               _prevAlpha = a;
               _aiFrames++; // AI 推理成功一帧（供 fps 角标结算）
               _updateAiDiag(a, size);
+              // ★B：把 alpha 发成 256² 小图给 GPU 当遮罩
+              if (kGpuComposite) _publishAlpha(a, size);
             } else if (eng.errorStreak > 0) {
               // 引擎「忙」不是错误；只有真的连续报错才计数 → 到阈值熔断
               _noteAiFailure();
@@ -445,29 +624,36 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           });
         }
 
-        // 本帧用当前最新的 alpha 立刻出画（首帧还没 alpha 时按原图出，不黑屏）
-        // ★预乘已合并进 _applySoftAlpha（省一遍全分辨率遍历）
-        final a = _prevAlpha;
-        if (a != null && a.length == size * size) {
-          // ★alpha 是「转正+裁方」坐标系的，贴回必须做逆变换（同 rotDeg）
-          _applySoftAlpha(rgba, a, size, size, widget.strength, w, h, rotDeg);
-        }
         final tA = DateTime.now();
-        msAlpha = tA.difference(tStart).inMilliseconds - msRgb - msSample;
-        img = await _decode(rgba, w, h);
-        msDecode = DateTime.now().difference(tA).inMilliseconds;
+        if (!kGpuComposite) {
+          // ---- 老路径：CPU 全分辨率合成 + 全屏 decode ----
+          // 本帧用当前最新的 alpha 立刻出画（首帧还没 alpha 时按原图出，不黑屏）
+          // ★预乘已合并进 _applySoftAlpha（省一遍全分辨率遍历）
+          final a = _prevAlpha;
+          if (a != null && a.length == size * size) {
+            // ★alpha 是「转正+裁方」坐标系的，贴回必须做逆变换（同 rotDeg）
+            _applySoftAlpha(rgba, a, size, size, widget.strength, w, h, rotDeg);
+          }
+          msAlpha = tA.difference(tStart).inMilliseconds - msRgb - msSample;
+          img = await _decode(rgba, w, h);
+          msDecode = DateTime.now().difference(tA).inMilliseconds;
+        }
+        // GPU 路径：什么都不用做 —— rgba 只用来喂模型，画面由 Texture + 遮罩在 GPU 合成
       } else {
         // 色布模式：只做真·色键；实景模式（不抠像）什么都不做
-        if (widget.keyColor >= 0) {
-          _applyChromaKey(rgba, w, h, widget.keyColor, widget.strength);
-          _premultiply(rgba, w, h);
+        if (widget.keyColor >= 0 || !kGpuComposite) {
+          if (widget.keyColor >= 0) {
+            _applyChromaKey(rgba, w, h, widget.keyColor, widget.strength);
+            _premultiply(rgba, w, h);
+          }
+          final tA = DateTime.now();
+          img = await _decode(rgba, w, h);
+          msDecode = DateTime.now().difference(tA).inMilliseconds;
         }
-        final tA = DateTime.now();
-        img = await _decode(rgba, w, h);
-        msDecode = DateTime.now().difference(tA).inMilliseconds;
+        // GPU 路径的实景/色布（无遮罩）：画面直接来自 Texture，不必转码解码
       }
       if (!mounted || gen != _camGen) {
-        img.dispose();
+        img?.dispose();
         return;
       }
 
@@ -479,6 +665,9 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           // ★镜像也要跟着帧走：否则切到后置时，冻结中的旧前置帧瞬间被去镜像，
           //   而 90° 旋转 + 去镜像 = 视觉上转 180° → 就是"先倒立一下"的真正原因
           _frameMirror = isFront;
+          // ★GPU 路径要这两样算 cover 比例：原始 buffer 尺寸 + 出过帧标记
+          _frameSize = Size(w.toDouble(), h.toDouble());
+          _hasFrame = true;
           _frames++;
           final now = DateTime.now();
           final dt = now.difference(_lastFps).inMilliseconds;
@@ -521,16 +710,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
 
   @override
   Widget build(BuildContext context) {
+    // 色布模式仍走 CPU 色键（遮罩那套只服务 AI 抠像）
+    final onGpu = kGpuComposite && _camera != null &&
+        _camera!.value.isInitialized && !(widget.keyColor >= 0);
     return Stack(fit: StackFit.expand, children: [
-      CustomPaint(painter: _CompositePainter(
-        background: _needBackground ? widget.background : null,
-        frame: _frame,
-        // 镜像与帧绑定（前置镜像、后置不镜像）；切摄像头时旧帧不会被去镜像
-        mirror: widget.mirror && _frameMirror,
-        sensorOrientation: _frameOrientation,
-        smooth: BeautySettings.smooth.value,
-        whiten: BeautySettings.whiten.value,
-      )),
+      if (onGpu) _gpuComposite() else _cpuComposite(),
       Positioned(
         // ★让开系统状态栏：之前 top:10 被状态栏时钟压住，关键诊断根本看不见
         top: MediaQuery.paddingOf(context).top + 6,
@@ -545,7 +729,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               borderRadius: BorderRadius.circular(12),
             ),
             child: Text(
-              '${_frame == null ? _status : '$_status · ${_fps.toStringAsFixed(0)}fps'}${_maskDbg.isEmpty ? '' : '\n$_maskDbg'}${_perfDbg.isEmpty ? '' : '\n$_perfDbg'}',
+              '${!_hasFrame ? _status : '$_status · ${_fps.toStringAsFixed(0)}fps'}${_maskDbg.isEmpty ? '' : '\n$_maskDbg'}${_perfDbg.isEmpty ? '' : '\n$_perfDbg'}',
               style: const TextStyle(color: Colors.white, fontSize: 11),
             ),
           ),
@@ -1177,6 +1361,18 @@ Future<ui.Image> _decode(Uint8List rgba, int w, int h) {
   return c.future;
 }
 
+/// 美白颜色矩阵：通道增益提亮 + 轻微降蓝让肤色更暖（painter 与 GPU 合成层共用）
+List<double> whitenMatrix(double whiten) {
+  final g = whiten * 0.22;
+  final o = whiten * 22;
+  return <double>[
+    1 + g, 0, 0, 0, o, //
+    0, 1 + g, 0, 0, o, //
+    0, 0, 1 + g * 0.85, 0, o * 0.85, //
+    0, 0, 0, 1, 0, //
+  ];
+}
+
 class _CompositePainter extends CustomPainter {
   final Gradient? background; // null = 不画背景（实景模式）
   final ui.Image? frame;
@@ -1193,18 +1389,6 @@ class _CompositePainter extends CustomPainter {
     this.smooth = 0,
     this.whiten = 0,
   });
-
-  /// 美白颜色矩阵：通道增益提亮 + 轻微降蓝让肤色更暖
-  List<double> _whitenMatrix() {
-    final g = whiten * 0.22;
-    final o = whiten * 22;
-    return <double>[
-      1 + g, 0, 0, 0, o, //
-      0, 1 + g, 0, 0, o, //
-      0, 0, 1 + g * 0.85, 0, o * 0.85, //
-      0, 0, 0, 1, 0, //
-    ];
-  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1255,11 +1439,11 @@ class _CompositePainter extends CustomPainter {
       final p = Paint()
         ..filterQuality = FilterQuality.high
         ..color = Color.fromRGBO(255, 255, 255, 1 - smooth * 0.55);
-      if (whiten > 0) p.colorFilter = ColorFilter.matrix(_whitenMatrix());
+      if (whiten > 0) p.colorFilter = ColorFilter.matrix(whitenMatrix(whiten));
       canvas.drawImageRect(img, src, rect, p);
     } else {
       final p = Paint()..filterQuality = FilterQuality.high;
-      if (whiten > 0) p.colorFilter = ColorFilter.matrix(_whitenMatrix());
+      if (whiten > 0) p.colorFilter = ColorFilter.matrix(whitenMatrix(whiten));
       canvas.drawImageRect(img, src, rect, p);
     }
     canvas.restore();
