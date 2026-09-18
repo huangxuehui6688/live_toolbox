@@ -1,0 +1,135 @@
+# 提词器悬浮窗改造 · 双 Agent 任务书
+
+> 项目：`live_toolbox`（AI直播副驾驶，Flutter）
+> 日期：2026-09-12
+> 目标：**把提词器从"App 内页面"改造成"悬浮窗"**，让主播在抖音/快手直播时也能看到台词。
+
+---
+
+## 一、背景（为什么必须改）
+
+现在提词器是 App 内的一个页面，**真直播时没用**——主播开播是在抖音 App 里，根本看不到我们 App 里的提词页。
+
+竞品（绿幕助手）的正解是：**悬浮窗提词**，浮在抖音上面，主播边播边看。
+
+补充结论（已确认，别再争论）：
+- 真人带货是**摄像头直播**，观众看的是主播的人，**拍不到屏幕**，所以悬浮窗**不会穿帮**。
+- 只有"录屏直播"才会把悬浮窗录进去（数字人走那条路，**不用悬浮窗**）。
+- 悬浮窗是 **Android 能力**，iOS 不支持（本次只做 Android）。
+
+## 二、要保留的已有资产（别推翻重做）
+
+智能跟读内核**已经做了**，有价值，保留：
+- `lib/services/asr_service.dart`（sherpa-onnx 流式识别，常驻 worker isolate）
+- `lib/services/asr_aligner.dart`（跨句累计 + 容错对齐，判断主播念到哪一行）
+- `lib/pages/teleprompter_page.dart`（现有提词 UI）
+
+本次改造 = **把已有内核装进"悬浮窗"这个新壳**，不是重写。
+
+---
+
+## 三、Agent A：悬浮窗载体（新文件为主）
+
+**负责文件（只改这些，不碰 B 的文件）：**
+- 新增 `lib/services/overlay_service.dart`
+- 新增 `lib/widgets/teleprompter_overlay.dart`
+- 修改 `android/app/src/main/AndroidManifest.xml`
+- 修改 `pubspec.yaml`（加悬浮窗插件）
+
+**任务：**
+1. 选一个悬浮窗插件（推荐 `flutter_overlay_window`，若更合适可换，但要说明原因）。
+2. `AndroidManifest.xml` 加悬浮窗权限：
+   ```xml
+   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+   ```
+3. 实现 `OverlayService` 单例，对外暴露下面第四节约定的接口（**方法名/参数必须一致，B 要调用）。
+4. 悬浮窗 UI（`teleprompter_overlay.dart`）：
+   - 大字号显示台词（主播一米外能看清）
+   - 当前行高亮，其余行暗色
+   - 可拖动位置、可调节透明度（避免挡住直播画面）
+   - 尽量小巧，不抢占屏幕
+5. 权限申请：首次开启悬浮窗时引导用户授权（国产 ROM 入口不同，做好提示文案）。
+6. **关键风险**：悬浮窗显示时宿主 App 可能退到后台，Android 会限制后台录音。A 需要配合 B 确认是否需要 **前台服务（Foreground Service）** 保活录音；如需，A 负责在 AndroidManifest 声明前台服务权限与 Service 配置。
+
+## 四、Agent B：台词库 + 跟读适配（改页面与已有服务）
+
+**负责文件（只改这些，不碰 A 的文件）：**
+- 新增 `lib/services/script_store.dart`
+- 修改 `lib/pages/teleprompter_page.dart`
+- 修改 `lib/services/asr_service.dart`（如需适配悬浮窗场景）
+- 修改 `lib/services/asr_aligner.dart`（如需）
+
+**任务：**
+1. **台词库（`script_store.dart`）**：对齐绿幕助手，支持多套话术草稿
+   - 新建 / 编辑 / 删除台词
+   - 本地持久化（shared_preferences 或文件）
+   - 列表按时间倒序
+2. **提词页改造（`teleprompter_page.dart`）**：
+   - 变成"台词库列表 + 新建台词"（参考绿幕助手布局）
+   - 每条台词有「**开启悬浮窗**」按钮 → 调用 A 的 `OverlayService` 把当前台词显示到悬浮窗
+   - 保留原有"智能跟读"能力的调用入口
+3. **跟读适配**：确保主播念词时，ASR 识别出的"当前行"能实时传给悬浮窗（通过第四节的 `updateLine` 接口刷新高亮）。
+4. 如 B 发现录音在悬浮窗/后台场景被系统掐断，把需求提给 A（前台服务保活），**不要自己改 AndroidManifest**（那是 A 的文件）。
+
+## 五、接口约定（必须严格遵守，否则集成失败）
+
+Agent A 提供，Agent B 调用：
+
+```dart
+// lib/services/overlay_service.dart
+class OverlayService {
+  static final OverlayService instance;
+
+  /// 是否有悬浮窗权限
+  Future<bool> hasPermission();
+
+  /// 请求悬浮窗权限（跳系统设置页）
+  Future<bool> requestPermission();
+
+  /// 显示悬浮窗，传入整篇台词（按行拆分后的列表）
+  Future<bool> show(List<String> lines);
+
+  /// 更新当前朗读到第几行（0-based，-1 表示还没开始）
+  Future<void> updateLine(int index);
+
+  /// 更新台词内容（主播切换了另一套话术时）
+  Future<void> updateLines(List<String> lines);
+
+  /// 关闭悬浮窗
+  Future<void> hide();
+
+  /// 悬浮窗是否正在显示
+  bool get isShowing;
+}
+```
+
+台词数据结构（B 定义、A 只用）：
+```dart
+class Script {
+  final String id;
+  final String title;    // 如"零食专场"
+  final String content;  // 全文，按 \n 拆行传给悬浮窗
+  final DateTime updatedAt;
+}
+```
+
+## 六、协作约束（重要）
+
+1. **文件绝对不重叠**——A 只碰自己那份，B 只碰自己那份。
+2. **都不许 `flutter build`**（构建环境今天崩了一天，Gradle 文件锁问题）。只跑 `flutter analyze` 自检，最后由我统一构建。
+3. 需要新增依赖时：**A 负责改 pubspec**（B 需要什么依赖告诉 A，或告诉我协调）。
+4. 两边先按接口各写各的，集成由我负责对接。
+
+## 七、验收标准
+
+- [ ] 主播在抖音直播时，能看到台词悬浮窗浮在抖音之上
+- [ ] 悬浮窗不穿帮（摄像头直播下观众看不到——这个已确认安全）
+- [ ] 台词自动滚动 / 或跟着主播念的进度高亮当前行（智能跟读）
+- [ ] 能存多套话术，开播前直接调出来
+- [ ] 悬浮窗可拖动、可调透明度
+- [ ] `flutter analyze` 无 error
+
+## 八、后续（本次不做）
+
+- 数字人直播**不用**悬浮窗（它走口型视频/AI 直接念，画面是推给观众的，悬浮窗会穿帮）。
+- iOS 悬浮窗（系统不支持，后续另想办法）。

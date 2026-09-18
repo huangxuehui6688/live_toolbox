@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>ASR 跟读（字幕）· 技术方案 v1</title>
+<style>
+  :root{--bg:#f6f7fb;--card:#fff;--line:#eceef4;--txt:#14151c;--sub:#6b7080;--dim:#9aa0b0;
+    --pink:#ff2d7a;--purple:#7c5cff;--grad:linear-gradient(135deg,#ff2d7a,#7c5cff);
+    --green:#0f9d76;--amber:#d08a00;--red:#e0403f;--blue:#1a6fe8;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#eef0f6;color:var(--txt);font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    line-height:1.65;padding:32px 0}
+  .wrap{max-width:980px;margin:0 auto;padding:0 24px}
+  h1{font-size:24px;font-weight:800;letter-spacing:-.3px;margin-bottom:6px}
+  h1 small{font-size:13px;color:var(--sub);font-weight:500;margin-left:8px}
+  h2{font-size:16px;font-weight:800;margin:26px 0 10px;display:flex;align-items:center;gap:8px}
+  h2::before{content:"";width:4px;height:16px;background:var(--grad);border-radius:2px}
+  h3{font-size:13.5px;font-weight:800;margin:14px 0 6px;color:var(--purple)}
+  p{margin:6px 0;color:#2a2c36}
+  .lede{background:linear-gradient(135deg,rgba(255,45,122,.08),rgba(124,92,255,.1));
+    border:1px solid rgba(124,92,255,.25);border-radius:12px;padding:14px 16px;
+    font-size:13px;color:#3d2f6b;margin:14px 0 22px}
+  .lede b{color:var(--pink)}
+  .card{background:var(--card);border-radius:14px;padding:16px 18px;margin:10px 0;
+    box-shadow:0 2px 10px rgba(20,21,28,.04)}
+  .card.warn{border-left:3px solid var(--amber);background:linear-gradient(90deg,rgba(208,138,0,.05),#fff 30%)}
+  .card.ok{border-left:3px solid var(--green);background:linear-gradient(90deg,rgba(15,157,118,.05),#fff 30%)}
+  .card.red{border-left:3px solid var(--red);background:linear-gradient(90deg,rgba(224,64,63,.05),#fff 30%)}
+  code{background:#f1f2f8;padding:1px 6px;border-radius:5px;font-size:12px;color:#5a3078;
+    font-family:ui-monospace,Menlo,monospace}
+  pre{background:#1a1c2b;color:#e8eaf3;padding:14px 16px;border-radius:10px;font-size:12px;
+    overflow-x:auto;line-height:1.6;margin:8px 0;font-family:ui-monospace,Menlo,monospace}
+  pre b{color:#ff7ab2}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:10px 0}
+  .kc{display:inline-block;font-size:11px;font-weight:800;padding:3px 8px;border-radius:6px;
+    letter-spacing:.3px;margin-right:4px}
+  .k-rec{background:rgba(15,157,118,.14);color:var(--green)}
+  .k-mid{background:rgba(26,111,232,.12);color:var(--blue)}
+  .k-bad{background:rgba(224,64,63,.12);color:var(--red)}
+  .k-warn{background:rgba(208,138,0,.14);color:var(--amber)}
+  .k-purp{background:rgba(124,92,255,.14);color:var(--purple)}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:12.5px}
+  th{text-align:left;background:#f6f7fb;padding:9px 10px;font-weight:800;color:var(--sub);
+    border-bottom:1px solid var(--line);font-size:11.5px;letter-spacing:.3px}
+  td{padding:10px;border-bottom:1px dashed var(--line);vertical-align:top}
+  tr:hover td{background:#fafbff}
+  td b{color:var(--txt)}
+  .star{background:linear-gradient(135deg,#fff5d0,#ffe6a8);font-weight:800}
+  .star td:first-child{position:relative}
+  .star td:first-child::before{content:"★";position:absolute;left:-2px;top:8px;color:#d4a01e;font-size:14px}
+  .star td:first-child{padding-left:18px}
+  ol,ul{margin:6px 0 6px 22px}
+  li{margin:3px 0}
+  .step{display:flex;gap:12px;margin:10px 0;align-items:flex-start}
+  .step .n{flex:0 0 28px;height:28px;border-radius:50%;background:var(--grad);color:#fff;
+    font-weight:800;display:flex;align-items:center;justify-content:center;font-size:13px;
+    box-shadow:0 3px 8px rgba(124,92,255,.28)}
+  .step .b{flex:1;padding-top:4px}
+  .step .b b{font-size:13px}
+  .step .b small{color:var(--sub);font-size:11.5px;display:block;margin-top:2px}
+  .ask{background:linear-gradient(135deg,#fff4d6,#fff0c2);border:1px solid #f0d68a;
+    border-radius:12px;padding:14px 16px;margin:18px 0 6px}
+  .ask b{color:#7a5b00}
+  .ask ul{margin:8px 0 0 22px}
+  .ask li{margin:4px 0;font-size:13px}
+  .small{font-size:11.5px;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>ASR 跟读（字幕）<small>· live_toolbox 技术方案 v1</small></h1>
+<p class="small">老板：这一份不是开发，是先把"用哪个 ASR 引擎、跟读和字幕谁先做"这两个核心决策拍板。你看完一句话回我就开干。</p>
+
+<div class="lede">
+  <b>一句话定位</b>：ASR 跟读（字幕）= 同一个 ASR 底座（语音→文字）的两个产品场景——
+  <b>跟读</b>是给主播提词器用的（"我读到第几行了，稿子滚到第几行"），
+  <b>字幕</b>是给观众看的（"主播说了什么，显示成文字"）。
+  底层是同一个引擎，区别只在<b>输出形态</b>（行号 vs 文字流）。
+</div>
+
+<h2>1 · 现状（代码证据）</h2>
+
+<div class="grid2">
+  <div class="card warn">
+    <h3>提词器 · FunASR 智能跟读</h3>
+    <p><code>lib/pages/teleprompter_page.dart</code> L243-302 的 <code>_readBar()</code> 已经有完整 UI（"FunASR 智能跟读"+ 实时徽标 + 语速条 + "跟读准确率 98%"），</p>
+    <p>但 <b>全是假数据</b>：</p>
+    <ul>
+      <li>L46-49：<code>_meter = 0.25 + _rnd.nextDouble() * 0.60</code> — 420ms 刷一次的随机数</li>
+      <li>L59-67：<code>_scroll = Timer.periodic</code> — 匀速滚动，跟主播读没读一点关系没有</li>
+      <li>L298："跟读准确率 98%" 硬编码</li>
+    </ul>
+    <p class="small">技术选型已用 UI 暗示"FunASR"，但 pubspec 里没装任何 ASR 包。</p>
+  </div>
+
+  <div class="card warn">
+    <h3>字幕 · 两处空占位</h3>
+    <p>① <code>main.dart</code> L301 主页四宫格 <code>_Quick(icon: '💬', label: '字幕')</code> — <b>无 onTap</b>，点不动</p>
+    <p>② <code>live_room_page.dart</code> L120 直播间右侧 <code>_sideBtn(Icons.subtitles_outlined, '字幕', () {})</code> — <b>onTap 空</b></p>
+    <p>连字幕页面/组件都没建。需从零做。</p>
+  </div>
+</div>
+
+<div class="card red">
+  <p><b>共同结论</b>：两个功能共享同一个 ASR 底座（"主播说话 → 一段段文字"），区别只在后续怎么用那段文字。
+  <b>必须先定 ASR 引擎，再同时搭底座，两个场景共用一份识别逻辑。</b></p>
+</div>
+
+<h2>2 · ASR 引擎选型（4 选 1）</h2>
+
+<table>
+  <colgroup><col style="width:18%"><col style="width:20.5%"><col style="width:20.5%"><col style="width:20.5%"><col style="width:20.5%"></colgroup>
+  <thead><tr><th>维度</th><th>A. 端侧 FunASR <span class="kc k-purp">推荐</span></th><th>B. 端侧 Sherpa-ONNX + Whisper</th><th>C. 云端 ASR API</th><th>D. Flutter speech_to_text 插件</th></tr></thead>
+  <tbody>
+    <tr><td><b>成本</b></td>
+      <td><span class="kc k-rec">0</span> 端侧跑，免费模型</td>
+      <td><span class="kc k-rec">0</span> 端侧跑，免费模型</td>
+      <td><span class="kc k-bad">贵</span> 约 ¥0.004/秒，算力型收费</td>
+      <td><span class="kc k-rec">0</span> 调用系统 ASR</td>
+    </tr>
+    <tr><td><b>识别精度</b></td>
+      <td><span class="kc k-rec">高</span> 中文 SOTA，离线工业级</td>
+      <td><span class="kc k-mid">中高</span> Whisper 中文偏弱</td>
+      <td><span class="kc k-rec">高</span> 商用级</td>
+      <td><span class="kc k-warn">中</span> 看机型，看系统（小米/华为差距大）</td>
+    </tr>
+    <tr><td><b>延迟</b></td>
+      <td><span class="kc k-rec">0.3-0.5s</span> 端侧，首包快</td>
+      <td><span class="kc k-mid">0.5-1s</span> 端侧，模型偏大</td>
+      <td><span class="kc k-bad">0.8-1.5s</span> 网络 + 服务端</td>
+      <td><span class="kc k-rec">0.2-0.4s</span> 端侧，最快</td>
+    </tr>
+    <tr><td><b>隐私/合规</b></td>
+      <td><span class="kc k-rec">全端侧</span> 不出境</td>
+      <td><span class="kc k-rec">全端侧</span> 不出境</td>
+      <td><span class="kc k-bad">出境</span> 主播声音上云</td>
+      <td><span class="kc k-rec">端侧</span> 但走系统</td>
+    </tr>
+    <tr><td><b>Flutter 集成难度</b></td>
+      <td><span class="kc k-bad">高</span> FFI 编译 ONNX，1-2 周</td>
+      <td><span class="kc k-mid">中</span> 有 Flutter 封装 sherpa_onnx，3-5 天</td>
+      <td><span class="kc k-rec">低</span> http 包发请求，1 天</td>
+      <td><span class="kc k-rec">低</span> pub 一行，1 小时</td>
+    </tr>
+    <tr><td><b>机型/系统兼容</b></td>
+      <td><span class="kc k-mid">需</span> 测高通/MTK 主流芯片</td>
+      <td><span class="kc k-mid">需</span> 同上</td>
+      <td><span class="kc k-rec">无</span> 只要有网</td>
+      <td><span class="kc k-bad">差</span> iOS/各 Android 厂商效果不一</td>
+    </tr>
+    <tr><td><b>跟读场景适配</b></td>
+      <td><span class="kc k-rec">优</span> 流式输出+时间戳，天然适配行号定位</td>
+      <td><span class="kc k-mid">可</span> 流式但行号定位要自己算</td>
+      <td><span class="kc k-mid">可</span> 看 API 是否带流式</td>
+      <td><span class="kc k-mid">可</span> 但中文断句不靠谱，跟读易跳行</td>
+    </tr>
+    <tr><td><b>字幕场景适配</b></td>
+      <td><span class="kc k-rec">优</span> 带标点的流式文本，省后期断句</td>
+      <td><span class="kc k-mid">可</span> Whisper 不带标点，要二次处理</td>
+      <td><span class="kc k-rec">优</span> 大厂 API 标点齐全</td>
+      <td><span class="kc k-bad">弱</span> 无标点，字幕易读性差</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>★ 方案 A（端侧 FunASR）推荐理由（三点）</h3>
+<div class="card ok">
+  <ul>
+    <li><b>跟项目既定方向一致</b>：<code>直播</code>项目的技术架构白纸黑字写"端侧零成本为主：FunASR/Whisper ASR"，UI 已经写"FunASR 智能跟读"，换引擎是改方向。</li>
+    <li><b>两个场景都最佳</b>：跟读需要的"流式 + 时间戳 + 行号定位"和字幕需要的"流式 + 标点"在 FunASR 都是开箱即用，Whisper 要补、speech_to_text 没有、云端要看 API。</li>
+    <li><b>成本结构决定一切</b>：方案 C 云端每分钟烧 token，2 小时直播 ¥0.5，叠加多语言扩展每场几块，长期是黑洞；端侧一次集成零边际成本。</li>
+  </ul>
+</div>
+
+<div class="card warn">
+  <p><b>方案 A 的硬骨头（一次性，不是长期）</b>：Flutter 集成 FunASR 要走 FFI + ONNX 编译，主流路线两条——</p>
+  <ul>
+    <li><b>路线 1</b>：用阿里达摩院 <code>funasr-runtime</code> C++ SDK + NDK 编译成 .so，Flutter 端写 <code>MethodChannel</code> 调用 → 灵活但工作量大（3-5 天）</li>
+    <li><b>路线 2</b>：用 <code>sherpa_onnx</code> Flutter 插件，<b>它已支持 FunASR ONNX 模型</b>（paraformer 流式 + 标点模型）→ 工作量小（1-2 天）</li>
+  </ul>
+  <p class="small">建议走路线 2。sherpa_onnx 是开源 ASR 引擎（k2-fsa 出品），不是 sherpa-ncnn，<b>支持 FunASR 的 paraformer 模型 + 标点模型</b>，Flutter 端用 <code>sherpa_onnx</code> pub 包即可，编译在包里完成。</p>
+</div>
+
+<h2>3 · 实现路径（分两阶段，共用一个 ASR 服务）</h2>
+
+<div class="card">
+  <h3>第一步 · 搭 ASR 底座（共用）</h3>
+  <pre>新增：<b>lib/services/asr_service.dart</b>  ← <b>唯一的 ASR 接入点</b>，跟读/字幕都调它
+├─ start() / stop() / pause() / resume()
+├─ stream: Stream&lt;AsrResult&gt;  ← 流式输出：{text, isFinal, startMs, endMs, confidence}
+├─ 内置：paraformer 流式模型 + 标点模型
+└─ 权限：复用 permission_handler 麦克风权限
+
+新增：<b>lib/services/asr_aligner.dart</b>  ← 跟读专用
+├─ 输入：ASR 流 + 提词稿（按"\n"分行）
+├─ 算法：滑动窗口比对 ASR 文本与每行，计算"主播读到了第几行"
+└─ 输出：Stream&lt;int&gt;  当前行号</pre>
+  <p class="small">这一步不接任何 UI，只把 <code>AsrService</code> 跑通，模拟一段录音能流式出文字就算成。</p>
+</div>
+
+<div class="card">
+  <h3>第二步 · 提词器接真 ASR（跟读）</h3>
+  <p>改 <code>teleprompter_page.dart</code> 的 <code>_readBar()</code> 和滚动逻辑：</p>
+  <ul>
+    <li>删 <code>_meter</code> 随机数 / <code>_meterTimer</code> / <code>_spdLabel</code> 假语速条</li>
+    <li>改 <code>_scroll</code> 匀速定时器为：<code>AsrAligner</code> 推送新行号 → setState 滚动</li>
+    <li>提词器"AI 跟读"开/关按钮：关 = 退回匀速定时器（旧逻辑保留），开 = 走 ASR</li>
+    <li>"跟读准确率"展示真实数据：<code>AsrResult.confidence</code> 滑动平均</li>
+  </ul>
+  <p class="small">这次能直接出可验证效果——把提词器开到 AI 跟读，对麦克风读稿子，UI 上能看到行号跟着走。</p>
+</div>
+
+<div class="card">
+  <h3>第三步 · 直播间字幕（共用 ASR 底座）</h3>
+  <p>从第二步复用 <code>AsrService</code>，新建字幕层：</p>
+  <ul>
+    <li><b>新增页面</b>：<code>lib/pages/subtitle_settings_page.dart</code>（字幕样式：字号/位置/底色/单/双语，主页「字幕」入口和直播间「字幕」按钮都跳这里）</li>
+    <li><b>新增组件</b>：<code>lib/widgets/live_caption_overlay.dart</code>（叠在相机预览上的字幕条，<code>VirtualBackgroundView</code> 之上用 <code>Stack</code> 叠加）</li>
+    <li><b>直播间接入</b>：在 <code>live_room_page.dart</code> 右侧"字幕"按钮 onTap 切 <code>bool _captionOn</code>，开 = 启动 <code>AsrService</code> + 显示 overlay，关 = 停</li>
+  </ul>
+  <p class="small">这一步的关键是"复用第二步的 AsrService"，不重复接入。</p>
+</div>
+
+<div class="card ok">
+  <p><b>阶段时间估算（端侧 FunASR 路线 2 走法）</b>：</p>
+  <ul>
+    <li>第一步 ASR 底座：1-2 天（含 <code>sherpa_onnx</code> 集成 + 模型下载 + 流式跑通）</li>
+    <li>第二步 提词器跟读：半天-1 天（把假数据替换为真流）</li>
+    <li>第三步 直播间字幕：1 天（页面 + 组件 + 接入）</li>
+    <li><b>合计 3-4 天</b>，可分两天提交（先跟读再字幕）</li>
+  </ul>
+</div>
+
+<h2>4 · 需要老板拍板的点</h2>
+
+<div class="ask">
+  <b>三个决策，一句话回我就行：</b>
+  <ul>
+    <li><b>决策 1 · ASR 引擎</b>：选 A（端侧 FunASR，路线 2 走 <code>sherpa_onnx</code> 插件）/ B（端侧 Whisper）/ C（云端 API）/ D（系统 <code>speech_to_text</code>）？
+      <br>我<b>推荐 A 路线 2</b>，理由见上。
+    </li>
+    <li><b>决策 2 · 字幕语言范围（仅影响字幕场景）</b>：首版字幕只做中文（与跟读稿语种一致），还是同时支持英/西/葡？
+      <br>如果选多语字幕，FunASR/Whisper 对外语支持不如中文，需要换引擎或加翻译层，<b>工程量翻倍</b>。
+    </li>
+    <li><b>决策 3 · 顺序</b>：先做"提词器跟读"再做"直播间字幕"（推荐，先验证 ASR 链路），还是两个一起做？
+      <br>我<b>推荐分两步</b>：跟读先跑通真 ASR，再复用底座做字幕。
+    </li>
+  </ul>
+</div>
+
+<p class="small" style="margin-top:22px">— 拍板即开干。建议读完直接回我三句"1=A、2=中文、3=分步"或哪里有不同意见我改。</p>
+
+</div>
+</body>
+</html>

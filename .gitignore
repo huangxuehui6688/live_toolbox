@@ -1,0 +1,51 @@
+# 本机产物 / 临时文件（不上云）
+# —— 构建、调试、冻结残留、截图、打包产物等，一律只留本地
+
+# 构建产物 / 打包
+*.apk
+*.aab
+*.apk.sha1
+build/
+build_*/
+_local_junk/
+*.frozen*
+*_locked_*
+
+# 日志 / 抓包
+*.log
+*.out
+*_out.txt
+analyze.log
+analyze_out.txt
+
+# 调试截图 / 临时文件
+_*.png
+_*.jpeg
+_*.jpg
+_*.txt
+*.tmp
+
+# Node / NestJS（server/ 用）
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.iml
+
+# 密钥：绝不入库
+*.pem
+*.key
+*.p12
+*.jks
+keystore.properties
