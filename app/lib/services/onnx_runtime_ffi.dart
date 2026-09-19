@@ -323,10 +323,19 @@ class OrtSession {
   /// 输出张量元素类型（实测两种权重都是 FLOAT，但按实测走更稳）
   int outputElementType = kOrtTypeFloat;
 
-  /// 模型输入边长（MODNet 是正方形输入）
-  int inputSize = 0;
+  /// 模型输入张量的高 / 宽（NCHW 的 [2]、[3]）。**支持非方形**。
+  ///
+  /// ★为什么必须支持非方形：手机画面是 9:16，而模型要方形输入，只有两条路，都试过：
+  ///   · 居中裁方 → 画面上下各 22% 模型根本看不到 → 一律抠成背景，人被切头切肩
+  ///   · 留边填灰 → 模型没见过这种分布 → 直接输出一坨怪块（真机实测）
+  ///   MODNet 的 ONNX 本来就是动态轴，直接喂 9:16 最干净：不裁、不留、细节也不丢。
+  int inputH = 0;
+  int inputW = 0;
 
-  /// 输出张量元素个数（= inputSize²）
+  /// 兼容旧写法（= 高）。新代码请用 inputH / inputW。
+  int get inputSize => inputH;
+
+  /// 输出张量元素个数（= inputH × inputW）
   int outputElementCount = 0;
 
   String inputName = '';
@@ -362,9 +371,14 @@ class OrtSession {
 
   bool _ok = false;
 
-  /// 打开模型。[preferSize] 只在模型输入是动态轴时生效。
+  /// 打开模型。[preferSize] / [preferW] / [preferH] 只在模型输入是动态轴时生效。
+  /// 不传 preferW/preferH 时退回正方形 preferSize。
   static OrtSession? open(String modelPath,
-      {int threads = 3, int preferSize = 512, String preferProvider = 'XNNPACK'}) {
+      {int threads = 3,
+      int preferSize = 512,
+      int? preferW,
+      int? preferH,
+      String preferProvider = 'XNNPACK'}) {
     final base = _openApiBase();
     if (base == nullptr) return null;
     final getApi = Pointer<NativeFunction<_NGetApi>>.fromAddress(
@@ -549,10 +563,11 @@ class OrtSession {
       ortFree(dcP);
 
       if (dims.length != 4) return null;
-      final h = dims[2] > 0 ? dims[2] : preferSize;
-      final w = dims[3] > 0 ? dims[3] : preferSize;
-      if (h <= 0 || h != w) return null;
-      self.inputSize = h;
+      final h = dims[2] > 0 ? dims[2] : (preferH ?? preferSize);
+      final w = dims[3] > 0 ? dims[3] : (preferW ?? preferSize);
+      if (h <= 0 || w <= 0) return null; // ★不再要求 h == w
+      self.inputH = h;
+      self.inputW = w;
 
       // ---- 输出元素数 ----
       // ★坑（已在 x86 上用 ctypes 预演复现）：MODNet 的输出也是**动态轴**，
@@ -595,8 +610,8 @@ class OrtSession {
             outElems = 1;
             for (int i = 0; i < odc; i++) {
               final d = odP[i];
-              // 动态维：批维（第 0 维）补 1，空间维补我们选定的输入尺寸
-              outElems *= d > 0 ? d : (i == 0 ? 1 : self.inputSize);
+              // 动态维：批维（第 0 维）补 1，空间维按 [2]=高 / [3]=宽 补
+              outElems *= d > 0 ? d : (i == 0 ? 1 : (i == 2 ? h : w));
             }
           }
           ortFree(odP);
@@ -604,12 +619,11 @@ class OrtSession {
       }
       ortFree(odcP);
       // 兜底：MODNet 输出就是 1×1×S×S
-      if (outElems <= 0) outElems = self.inputSize * self.inputSize;
+      if (outElems <= 0) outElems = h * w;
       self.outputElementCount = outElems;
 
       // ---- 输入张量（native 缓冲，一次建好，跨帧复用） ----
-      final inLen = self.inputSize * self.inputSize * 3 *
-          ortElemBytes(self.inputElementType);
+      final inLen = h * w * 3 * ortElemBytes(self.inputElementType);
       self._inData = ortMalloc(inLen);
       if (self.inputElementType == kOrtTypeFloat) {
         self.inputF32 = self._inData.cast<Float>().asTypedList(inLen ~/ 4);
@@ -622,8 +636,8 @@ class OrtSession {
       final inShape = ortMalloc(32).cast<Int64>();
       inShape[0] = 1;
       inShape[1] = 3;
-      inShape[2] = self.inputSize;
-      inShape[3] = self.inputSize;
+      inShape[2] = h;
+      inShape[3] = w;
       final inValOut = newShell();
       final e6 = takeErr(_dStatusTensorData(
               api, _iCreateTensorWithDataAsOrtValue)(
@@ -640,8 +654,8 @@ class OrtSession {
       final outShape = ortMalloc(32).cast<Int64>();
       outShape[0] = 1;
       outShape[1] = 1;
-      outShape[2] = self.inputSize;
-      outShape[3] = self.inputSize;
+      outShape[2] = h;
+      outShape[3] = w;
       final outValOut = newShell();
       final e7 = takeErr(_dStatusTensorData(
               api, _iCreateTensorWithDataAsOrtValue)(

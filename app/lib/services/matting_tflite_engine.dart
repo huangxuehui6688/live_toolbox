@@ -38,7 +38,10 @@ class TfliteGpuEngine implements MattingEngine {
   int get errorStreak => _errStreak;
 
   @override
-  int get inputSize => _inputSize;
+  int get inputH => _inputSize;
+
+  @override
+  int get inputW => _inputSize;
 
   @override
   Future<bool> load() async {

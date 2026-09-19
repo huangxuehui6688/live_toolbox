@@ -15,6 +15,24 @@ import '../services/matting_engine.dart';
 /// AI 抠像连续失败多少次即熔断（停止重试 + 自动降级到实景）。
 const int kAiFailLimit = 8;
 
+/// ★模型输入是否用"与画面同长宽比"的非方形尺寸（画面 100% 进模型）。
+///
+/// 为什么要有这个开关：模型要方形输入，而手机画面是 9:16，两条路都走过：
+///   · 居中裁方 → 画面上下各 22% 模型看不到 → 一律抠成背景，人被切头切肩
+///   · 留边填灰 → 模型没见过这种分布 → 直接输出一坨怪块（真机实测翻车）
+/// MODNet 的 ONNX 是动态轴，直接喂 9:16 最干净。置 false 可退回老裁方行为。
+const bool kFullFrameInput = true;
+
+/// 模型输入的目标宽度（高按画面长宽比算）。192 宽时推理耗时与原来 256² 相当，
+/// 画面却 100% 进模型 —— 这是覆盖率和帧率之间比较划算的一档。
+const int kAiInputWidth = 192;
+
+/// 运行期生效的"整幅缩放"开关 = [kFullFrameInput] 且**引擎回报的输入确实非方形**。
+/// 若 ONNX 把输入写死成方形（动态轴没生效），就必须退回居中裁方 ——
+/// 否则把 9:16 的画面硬塞进方形等于把人压扁，抠像必定崩。
+/// 由 `_loadEngine` 在引擎加载成功后设定；三个几何函数（正向采样 / 反向映射 / 遮罩图）共用。
+bool gFullFrameInput = kFullFrameInput;
+
 /// 真机实时相机 + 可选抠像换背景。
 /// [enableSegmentation]=true：AI 人像抠像（MODNet + ONNX Runtime）+ 与 [background] 合成。
 /// [enableSegmentation]=false：纯相机原图（实景模式，不抠像、不耗时）。
@@ -87,7 +105,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// false = 回到"每帧 CPU 全分辨率合成 + decode 全屏图"的老路径（代码原样保留）。
   static const bool kGpuComposite = true;
 
-  ui.Image? _alphaImg; // 256² alpha 小图（RGBA 白底，只取 alpha 通道当遮罩）
+  /// 模型输入尺寸（_init 里按画面长宽比定；默认按 9:16 给）
+  int _aiInW = kAiInputWidth;
+  int _aiInH = 342;
+
+  ui.Image? _alphaImg; // alpha 小图（RGBA 白底，只取 alpha 通道当遮罩）
   bool _alphaImgBusy = false; // 上一张还没建好就跳过（alpha 本身只有 2~4fps）
   int _alphaSeq = 0;
   bool _hasFrame = false; // 出过至少一帧（HUD 用它决定显不显示 fps）
@@ -212,6 +234,21 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       );
       await _camera!.initialize();
       if (gen != _camGen) return;
+      // ★按"转正后画面"的长宽比定模型输入尺寸：这样画面能 100% 进模型
+      //   （裁方会切掉上下各 22%，留边会被模型当垃圾输入）
+      if (kFullFrameInput) {
+        final swapO = ((360 - orientation) % 360) % 180 != 0;
+        final ps = _camera!.value.previewSize ?? const Size(1920, 1080);
+        final uw = swapO ? ps.height : ps.width;
+        final uh = swapO ? ps.width : ps.height;
+        if (uw > 0 && uh > 0) {
+          _aiInW = kAiInputWidth;
+          _aiInH = (_aiInW * uh / uw).round().clamp(64, 1024);
+        }
+      } else {
+        _aiInW = 256;
+        _aiInH = 256;
+      }
       // 持续自动对焦（近距离拍摄时尤为关键；机型不支持就忽略）
       try {
         await _camera!.setFocusMode(FocusMode.auto);
@@ -260,7 +297,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     final t0 = DateTime.now();
     try {
       DiagLog.instance.log('SEG', '开始加载引擎 ONNX/CPU（第 $_loadFails 次重试前）');
-      final e = ModnetMattingEngine(threads: 4);
+      // 线程给到 5：非方形输入比原来方形多约 36% 像素，靠多一两个线程把
+      // alpha 刷新率（原来 ~4fps）基本拉回来
+      final e = ModnetMattingEngine(
+        threads: 5,
+        preferW: _aiInW,
+        preferH: _aiInH,
+      );
       final ok = await e.load().timeout(const Duration(seconds: 45));
       if (!mounted) {
         await e.dispose();
@@ -270,7 +313,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (ok) {
         _engine = e;
         _loadFails = 0;
-        DiagLog.instance.log('SEG', 'MODNet 就绪 ${ms}ms · ${e.diag}');
+        // ★以引擎回报的尺寸为准：只有真拿到非方形输入，才能走"整幅缩放"
+        gFullFrameInput = kFullFrameInput && e.inputW != e.inputH;
+        DiagLog.instance.log('SEG',
+            'MODNet 就绪 ${ms}ms · ${e.diag} · 整幅输入=${gFullFrameInput ? "是" : "否(退回裁方)"}');
       } else {
         await e.dispose();
         _noteLoadFailure('load() 返回 false（${ms}ms）');
@@ -321,8 +367,9 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 把 256² 的 alpha 发成一张小 `ui.Image` 交给 GPU 当遮罩。
   /// 256*256*4 = 256KB（对比原来每帧一张 1080p 大图 ≈ 8MB），而且只有 AI 出新 alpha
   /// 时才建（2~4 次/秒），对主线程几乎无感。
-  /// [a] 必须是**已经 shapeAlpha 整形过**的 alpha（观感靠它），[size] 是模型输入边长。
-  void _publishAlpha(Float32List a, int size) {
+  /// [a] 必须是**已经 shapeAlpha 整形过**的 alpha（观感靠它），
+  /// [aw]/[ah] 是 alpha（= 模型输入）的宽和高（支持非方形）。
+  void _publishAlpha(Float32List a, int aw, int ah) {
     if (_alphaImgBusy) return;
     // 遮罩图要覆盖**整幅画面**（不再只是中间那个方块）：
     // 取与转正画面同长宽比的小图（长边 256），逐点反查 alpha（双线性），
@@ -334,18 +381,18 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     if (uw <= 0 || uh <= 0) return;
     final mw = uw >= uh ? 256 : math.max(8, (256 * uw / uh).round());
     final mh = uh >= uw ? 256 : math.max(8, (256 * uh / uw).round());
-    final af = sampleAffine(uw, uh, size, true);
+    final af = sampleAffine(uw, uh, aw, ah);
     final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
     _alphaImgBusy = true;
     final px = Uint8List(mw * mh * 4);
-    final awf = size - 1;
+    final awf = aw - 1, ahf = ah - 1;
     for (int my = 0, o = 0; my < mh; my++) {
       final uy = my * uh / mh;
       final ay = (uy - aY) / bY; // 画面坐标 → 模型坐标
       var y0 = ay.floor();
       if (y0 < 0) y0 = 0;
-      if (y0 > awf) y0 = awf;
-      final y1 = y0 + 1 <= awf ? y0 + 1 : awf;
+      if (y0 > ahf) y0 = ahf;
+      final y1 = y0 + 1 <= ahf ? y0 + 1 : ahf;
       final ty = (ay - y0).clamp(0.0, 1.0);
       for (int mx = 0; mx < mw; mx++) {
         final ux = mx * uw / mw;
@@ -355,8 +402,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         if (x0 > awf) x0 = awf;
         final x1 = x0 + 1 <= awf ? x0 + 1 : awf;
         final tx = (ax - x0).clamp(0.0, 1.0);
-        final t0 = a[y0 * size + x0] + (a[y0 * size + x1] - a[y0 * size + x0]) * tx;
-        final t1 = a[y1 * size + x0] + (a[y1 * size + x1] - a[y1 * size + x0]) * tx;
+        final t0 = a[y0 * aw + x0] + (a[y0 * aw + x1] - a[y0 * aw + x0]) * tx;
+        final t1 = a[y1 * aw + x0] + (a[y1 * aw + x1] - a[y1 * aw + x0]) * tx;
         final v = ((t0 + (t1 - t0) * ty) * 255.0).clamp(0.0, 255.0).toInt();
         // 预乘白：RGB 与 A 同值，遮罩只看 alpha 通道
         px[o++] = v;
@@ -532,8 +579,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   }
 
   /// 喂给模型的方形 RGB 缓冲（跨帧复用）
-  Uint8List _aiRgbOf(int size) {
-    final need = size * size * 3;
+  Uint8List _aiRgbOf(int n) {
+    final need = n * 3;
     final b = _aiRgbBuf;
     if (b == null || b.length != need) {
       _aiRgbBuf = Uint8List(need);
@@ -543,7 +590,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   }
 
   /// 诊断串：模型输出 alpha 的真实分布（排查"抠像没生效/抠太多"用）
-  void _updateAiDiag(Float32List alpha, int size) {
+  void _updateAiDiag(Float32List alpha, int aw, int ah) {
     int bg = 0, sampled = 0;
     double sum = 0, mn = 1, mx = 0;
     for (int k = 0; k < alpha.length; k += 16) {
@@ -557,7 +604,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     final n = sampled == 0 ? 1 : sampled;
     final prov = _engine?.diag ?? '';
     _maskDbg = '${prov.isEmpty ? '' : '$prov  '}'
-        'AI ${size}x$size 背景${(bg * 100 / n).round()}% '
+        'AI ${aw}x$ah 背景${(bg * 100 / n).round()}% '
         '均值${(sum / n).toStringAsFixed(2)} '
         '最低${mn.toStringAsFixed(2)} 最高${mx.toStringAsFixed(2)}';
   }
@@ -613,14 +660,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (useAi) {
         final eng = _engine;
         if (eng == null) return;
-        final size = eng.inputSize;
-        // ---- 送给模型：转正 + 居中裁方 + 缩放到模型输入尺寸（一次采样搞定）----
+        final iw = eng.inputW, ih = eng.inputH;
+        // ---- 送给模型：转正 + 缩放到模型输入尺寸（整幅画面，不裁不留边）----
         // ★相机给的是「传感器原始横版」buffer，必须按 sensorOrientation 转正，
         //   否则模型看到的是侧躺的人，抠像质量会明显变差。
-        final rgb = _aiRgbOf(size);
+        final rgb = _aiRgbOf(iw * ih);
         final rotDeg = (360 - orientation) % 360;
-        // ★GPU 路径用 fit（整幅缩进方形，画面全覆盖）；老 CPU 路径保持居中裁方不动
-        _sampleSquareRgb(rgba, w, h, rotDeg, size, rgb, fit: kGpuComposite);
+        _sampleSquareRgb(rgba, w, h, rotDeg, iw, ih, rgb);
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
 
         // ---- ★★ 出画与推理解耦（不然手机端会掉成幻灯片）★★ ----
@@ -635,10 +681,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           // rgb 是复用缓冲，请求在途时会被下一帧覆盖 → 拷一份交给后台
           final payload = Uint8List.fromList(rgb);
           final myGen = gen;
-          eng.matting(payload, size, size).then((a) {
+          eng.matting(payload, iw, ih).then((a) {
             _aiReqPending = false;
             if (!mounted || myGen != _camGen) return;
-            if (a != null && a.length == size * size) {
+            if (a != null && a.length == iw * ih) {
               _aiFail = 0; // ★跑通了 → 连续失败计数清零
               // ★帧间平滑（EMA）：新帧 65% + 上一帧 35%。AI 只有 8fps，
               //   逐帧 alpha 抖动（边缘忽有忽无/闪烁）被明显压平；
@@ -651,12 +697,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               }
               _prevAlpha = a;
               _aiFrames++; // AI 推理成功一帧（供 fps 角标结算）
-              _updateAiDiag(a, size);
+              _updateAiDiag(a, iw, ih);
               // ★B：把 alpha 发成小图给 GPU 当遮罩。
               //   ★必须先用 shapeAlpha 整形（区域清理 + 羽化 + 强度映射），
               //     否则边缘是一圈锯齿 —— 老 CPU 路径的清晰度就来自这一步。
               if (kGpuComposite) {
-                _publishAlpha(shapeAlpha(a, size, size, widget.strength), size);
+                _publishAlpha(
+                    shapeAlpha(a, iw, ih, widget.strength), iw, ih);
               }
             } else if (eng.errorStreak > 0) {
               // 引擎「忙」不是错误；只有真的连续报错才计数 → 到阈值熔断
@@ -673,9 +720,9 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           // 本帧用当前最新的 alpha 立刻出画（首帧还没 alpha 时按原图出，不黑屏）
           // ★预乘已合并进 _applySoftAlpha（省一遍全分辨率遍历）
           final a = _prevAlpha;
-          if (a != null && a.length == size * size) {
-            // ★alpha 是「转正+裁方」坐标系的，贴回必须做逆变换（同 rotDeg）
-            _applySoftAlpha(rgba, a, size, size, widget.strength, w, h, rotDeg);
+          if (a != null && a.length == iw * ih) {
+            // ★alpha 与画面同坐标系（整幅缩放的逆变换），贴回按同一套仿射
+            _applySoftAlpha(rgba, a, iw, ih, widget.strength, w, h, rotDeg);
           }
           msAlpha = tA.difference(tStart).inMilliseconds - msRgb - msSample;
           img = await _decode(rgba, w, h);
@@ -791,7 +838,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               borderRadius: BorderRadius.circular(10),
             ),
             child: Text(
-              'AI 抠像 ${_aiFps.toStringAsFixed(1)}fps · 输入${_engine!.inputSize}²',
+              'AI 抠像 ${_aiFps.toStringAsFixed(1)}fps · '
+              '输入${_engine!.inputW}×${_engine!.inputH}',
               style: const TextStyle(
                   color: Colors.white70, fontSize: 9, height: 1.2),
             ),
@@ -879,17 +927,16 @@ void _nv21ToRgbaInto(Uint8List nv21, int w, int h, Uint8List out) {
 /// 计算「模型输入坐标 → 转正画面坐标」的仿射参数，返回 `[aX, bX, aY, bY]`，
 /// 即 `画面坐标 = a + b × 模型坐标`。正/反向映射、遮罩图都从这里取，保证三处一致。
 ///
-/// * `fit = false`：**居中裁方**（老行为）—— 画面上下各 22% 不在模型视野内，会被抠成背景
-/// * `fit = true` ：**整幅缩进方形 + 四周留边** —— 画面 100% 在模型视野内（B 方案用这个）
-List<double> sampleAffine(int uw, int uh, int size, bool fit) {
-  if (fit) {
-    final sc = size / (uw > uh ? uw : uh); // 模型像素 / 画面像素
-    return <double>[
-      -(size - uw * sc) / 2 / sc, 1 / sc, //
-      -(size - uh * sc) / 2 / sc, 1 / sc, //
-    ];
+/// * [gFullFrameInput] = true：**整幅画面缩放到 (iw×ih)** —— 不裁不留边，画面全覆盖
+/// * false：**居中裁方**（老行为）—— 画面上下各 22% 不在模型视野内，会被抠成背景
+List<double> sampleAffine(int uw, int uh, int iw, int ih) {
+  if (gFullFrameInput) {
+    // 整幅画面线性缩放到 (iw×ih)：不裁、不留边，画面 100% 在模型视野内
+    return <double>[0, uw / iw, 0, uh / ih];
   }
+  // 老行为：居中裁方（画面上下各 22% 模型看不到）
   final side = uw < uh ? uw : uh;
+  final size = iw < ih ? iw : ih;
   final step = side / size;
   return <double>[
     (uw - side) / 2.0, step, //
@@ -897,28 +944,27 @@ List<double> sampleAffine(int uw, int uh, int size, bool fit) {
   ];
 }
 
-/// 从全分辨率 RGBA 取一块「转正 + 居中裁方 + 缩放到 size×size」的 RGB，
+/// 从全分辨率 RGBA 取一块「转正 + 缩放到 iw×ih」的 RGB，
 /// 写入 [out]（长度 size*size*3）。这是喂给 MODNet 的输入。
 ///
 /// ★为什么必须转正：相机给的是传感器原始横版 buffer，不转正模型看到的就是
 ///   「侧躺的人」，抠像质量明显下降（漏抠、把背景圈进人像）。
-/// ★为什么居中裁方：MODNet 是方形输入，直接拉伸会把竖幅人像压扁变型；
-///   居中裁方保住真实比例，代价是画面上下被裁（直播时人像本来居中，影响很小）。
-void _sampleSquareRgb(Uint8List rgba, int w, int h, int rotDeg, int size,
-    Uint8List out, {bool fit = false}) {
+/// ★缩放方式由 [gFullFrameInput] / [sampleAffine] 决定：
+///   默认整幅画面按比例缩放到 iw×ih（不裁不留边，画面 100% 进模型）。
+void _sampleSquareRgb(Uint8List rgba, int w, int h, int rotDeg, int iw, int ih,
+    Uint8List out) {
   // 转正后的尺寸
   final swap = rotDeg == 90 || rotDeg == 270;
   final uw = swap ? h : w;
   final uh = swap ? w : h;
-  final af = sampleAffine(uw, uh, size, fit);
+  final af = sampleAffine(uw, uh, iw, ih);
   final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
 
   int o = 0;
-  for (int oy = 0; oy < size; oy++) {
+  for (int oy = 0; oy < ih; oy++) {
     final uy = aY + oy * bY;
-    // fit 模式下留边处没有画面内容 → 填中性灰（归一化后 ≈0，模型当背景）
-    final rowPad = fit && (uy < 0 || uy > uh - 1);
-    for (int ox = 0; ox < size; ox++) {
+    final rowPad = uy < 0 || uy > uh - 1;
+    for (int ox = 0; ox < iw; ox++) {
       final ux = aX + ox * bX;
       if (rowPad || ux < 0 || ux > uw - 1) {
         out[o++] = 128;
@@ -1277,7 +1323,7 @@ void _applySoftAlpha(Uint8List rgba, Float32List alpha, int aw, int ah,
   //   保证「CPU 合成」和「GPU 遮罩」两种出画的观感一致 ----
   final blurred = shapeAlpha(alpha, aw, ah, strength);
 
-  // ---- ⑤ 逆变换贴回全分辨率：原始像素 → 转正坐标 → 裁方窗口 → alpha 坐标 ----
+  // ---- ⑤ 逆变换贴回全分辨率：原始像素 → 转正坐标 → 模型输入坐标 ----
   // 与 _sampleSquareRgb 的正向变换互逆：
   //   rot 90 : ux = h-1-j（行常数）, uy = i（随 i 递增）
   //   rot 180: ux = w-1-i, uy = h-1-j
@@ -1286,10 +1332,10 @@ void _applySoftAlpha(Uint8List rgba, Float32List alpha, int aw, int ah,
   final swap = rotDeg == 90 || rotDeg == 270;
   final uw = swap ? h : w;
   final uh = swap ? w : h;
-  final side = uw < uh ? uw : uh;
-  final cropX = (uw - side) / 2.0;
-  final cropY = (uh - side) / 2.0;
-  final step = side / aw; // 与 _sampleSquareRgb 的 step 一致（aw == 模型 size）
+  // 与 _sampleSquareRgb 的正向仿射互逆：模型坐标 = (画面坐标 - a) / b
+  final af = sampleAffine(uw, uh, aw, ah);
+  final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
+  final invBX = 1.0 / bX, invBY = 1.0 / bY;
 
   final awf = aw - 1, ahf = ah - 1;
   // 逐行预计算：ax/ay 在行内随 i 线性步进（步长 axD/ayD），免去逐像素乘除。
@@ -1297,27 +1343,27 @@ void _applySoftAlpha(Uint8List rgba, Float32List alpha, int aw, int ah,
     double axRow, ayRow, axD, ayD;
     switch (rotDeg) {
       case 90: // ux = h-1-j, uy = i
-        axRow = ((h - 1 - j) - cropX) / step;
-        ayRow = 0 - cropY / step;
+        axRow = ((h - 1 - j) - aX) * invBX;
+        ayRow = (0 - aY) * invBY;
         axD = 0.0;
-        ayD = 1.0 / step;
+        ayD = invBY;
         break;
       case 180: // ux = w-1-i, uy = h-1-j
-        axRow = ((w - 1) - cropX) / step;
-        ayRow = ((h - 1 - j) - cropY) / step;
-        axD = -1.0 / step;
+        axRow = ((w - 1) - aX) * invBX;
+        ayRow = ((h - 1 - j) - aY) * invBY;
+        axD = -invBX;
         ayD = 0.0;
         break;
       case 270: // ux = j, uy = w-1-i
-        axRow = (j - cropX) / step;
-        ayRow = ((w - 1) - cropY) / step;
+        axRow = (j - aX) * invBX;
+        ayRow = ((w - 1) - aY) * invBY;
         axD = 0.0;
-        ayD = -1.0 / step;
+        ayD = -invBY;
         break;
       default: // rot 0: ux = i, uy = j
-        axRow = 0 - cropX / step;
-        ayRow = (j - cropY) / step;
-        axD = 1.0 / step;
+        axRow = (0 - aX) * invBX;
+        ayRow = (j - aY) * invBY;
+        axD = invBX;
         ayD = 0.0;
         break;
     }

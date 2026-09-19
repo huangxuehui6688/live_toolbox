@@ -30,13 +30,16 @@ abstract class MattingEngine {
   /// 加载模型（幂等）。失败返回 false。
   Future<bool> load();
 
-  /// [rgb] 长度 >= w*h*3；返回长度 = [inputSize]² 的软 alpha；失败返回 null。
+  /// [rgb] 长度 >= w*h*3；返回长度 = [inputH]×[inputW] 的软 alpha；失败返回 null。
   Future<Float32List?> matting(Uint8List rgb, int w, int h);
 
   Future<void> dispose();
 
-  /// 模型输入边长（正方形）
-  int get inputSize;
+  /// 模型输入张量的高（NCHW 的 [2]）。★支持非方形，见 OrtSession.inputH 的说明。
+  int get inputH;
+
+  /// 模型输入张量的宽（NCHW 的 [3]）
+  int get inputW;
 
   /// 连续错误次数。★**跳帧不算错误**（上一次还没推完就返回 null 是正常节流），
   /// 调用方据此判断"引擎是不是真的坏了"，到阈值才熔断。
@@ -63,6 +66,8 @@ class ModnetMattingEngine implements MattingEngine {
     this.assetPath = kModnetAssetPath,
     this.threads = 3,
     this.preferSize = 256,
+    this.preferW,
+    this.preferH,
   });
 
   final String assetPath;
@@ -71,6 +76,11 @@ class ModnetMattingEngine implements MattingEngine {
   /// 模型输入是动态轴时用的边长（模型若写死尺寸则以模型为准）
   final int preferSize;
 
+  /// 动态轴时的目标输入宽 / 高。★传了就用非方形（画面同长宽比），
+  /// 这样画面 100% 进模型 —— 既不裁掉上下、也不留边。
+  final int? preferW;
+  final int? preferH;
+
   Isolate? _iso;
   SendPort? _cmd;
   ReceivePort? _rsp;
@@ -78,7 +88,8 @@ class ModnetMattingEngine implements MattingEngine {
   int _seq = 0;
   bool _ready = false;
   bool _busy = false; // 上一帧还没推完 → 本帧直接跳过（跳帧）
-  int _inputSize = 512;
+  int _inputH = 512;
+  int _inputW = 512;
   int _errStreak = 0;
 
   @override
@@ -88,7 +99,10 @@ class ModnetMattingEngine implements MattingEngine {
   int get errorStreak => _errStreak;
 
   @override
-  int get inputSize => _inputSize;
+  int get inputH => _inputH;
+
+  @override
+  int get inputW => _inputW;
 
   bool get isReady => _ready;
 
@@ -130,6 +144,8 @@ class ModnetMattingEngine implements MattingEngine {
           'path': path,
           'threads': threads,
           'size': preferSize,
+          'iw': preferW,
+          'ih': preferH,
           'provider': entry.value,
         }, const Duration(seconds: 90));
         if (r == null) {
@@ -147,10 +163,12 @@ class ModnetMattingEngine implements MattingEngine {
           DiagLog.instance.log('MATTING', 'NNAPI 未生效（$active），弃用 int8');
           continue;
         }
-        _inputSize = (r['size'] as int?) ?? 512;
-        if (_inputSize <= 0) _inputSize = 512;
+        _inputH = (r['h'] as int?) ?? (r['size'] as int?) ?? 512;
+        _inputW = (r['w'] as int?) ?? (r['size'] as int?) ?? 512;
+        if (_inputH <= 0) _inputH = 512;
+        if (_inputW <= 0) _inputW = 512;
         final model = entry.key == kModnetInt8AssetPath ? 'int8' : 'fp32';
-        diag = '$active · $model · ${_inputSize}x$_inputSize';
+        diag = '$active · $model · ${_inputW}x$_inputH';
         _ready = true;
         DiagLog.instance.log('MATTING', 'MODNet 就绪：$diag');
         return true;
@@ -289,6 +307,8 @@ Future<void> _modnetWorker(SendPort replyPort) async {
           msg['path'] as String,
           threads: (msg['threads'] as int?) ?? 3,
           preferSize: (msg['size'] as int?) ?? 512,
+          preferW: msg['iw'] as int?,
+          preferH: msg['ih'] as int?,
           preferProvider: (msg['provider'] as String?) ?? 'XNNPACK',
         );
         final s = sess;
@@ -302,11 +322,12 @@ Future<void> _modnetWorker(SendPort replyPort) async {
           final providers = OrtSession.availableProviders();
           debugPrint('[MATTING] ORT 执行提供器: $providers');
           debugPrint('[MATTING] 实际使用: ${s.activeProvider} · '
-              '输入 ${s.inputSize}x${s.inputSize} · 类型 ${s.inputElementType}');
+              '输入 ${s.inputW}x${s.inputH} · 类型 ${s.inputElementType}');
           replyPort.send(<String, Object?>{
             'id': id,
             'ok': true,
-            'size': s.inputSize,
+            'w': s.inputW,
+            'h': s.inputH,
             'provider': s.activeProvider,
             'version': s.ortVersion,
             'providers': providers,
@@ -339,15 +360,16 @@ Future<void> _modnetWorker(SendPort replyPort) async {
 ///
 /// 双线性降采样：直接把相机大图缩到模型输入尺寸，不做中间全尺寸拷贝。
 void _fillInput(OrtSession s, Uint8List rgb, int w, int h) {
-  final size = s.inputSize;
-  final plane = size * size;
+  final iw = s.inputW;
+  final ih = s.inputH;
+  final plane = iw * ih;
   final asFloat = s.inputElementType == kOrtTypeFloat;
   final f = s.inputF32;
   final u = s.inputU8;
 
   // 快路径：调用方已经按模型输入尺寸给好了（view 层就是这么做的），
   // 直接逐像素写 NCHW，省掉一次"恒等双线性"。
-  if (w == size && h == size) {
+  if (w == iw && h == ih) {
     final n = plane;
     if (asFloat) {
       for (int i = 0, p = 0; i < n; i++) {
@@ -367,18 +389,18 @@ void _fillInput(OrtSession s, Uint8List rgb, int w, int h) {
     return;
   }
 
-  final xr = w > 1 ? (w - 1) / (size - 1) : 0.0;
-  final yr = h > 1 ? (h - 1) / (size - 1) : 0.0;
+  final xr = w > 1 ? (w - 1) / (iw - 1) : 0.0;
+  final yr = h > 1 ? (h - 1) / (ih - 1) : 0.0;
 
-  for (int y = 0; y < size; y++) {
+  for (int y = 0; y < ih; y++) {
     final fy = y * yr;
     final y0 = fy.floor();
     final y1 = y0 + 1 < h ? y0 + 1 : h - 1;
     final ty = fy - y0;
     final row0 = y0 * w;
     final row1 = y1 * w;
-    final outRow = y * size;
-    for (int x = 0; x < size; x++) {
+    final outRow = y * iw;
+    for (int x = 0; x < iw; x++) {
       final fx = x * xr;
       final x0 = fx.floor();
       final x1 = x0 + 1 < w ? x0 + 1 : w - 1;
