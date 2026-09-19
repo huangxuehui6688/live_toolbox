@@ -321,6 +321,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 把 256² 的 alpha 发成一张小 `ui.Image` 交给 GPU 当遮罩。
   /// 256*256*4 = 256KB（对比原来每帧一张 1080p 大图 ≈ 8MB），而且只有 AI 出新 alpha
   /// 时才建（2~4 次/秒），对主线程几乎无感。
+  /// [a] 必须是**已经 shapeAlpha 整形过**的 alpha（观感靠它），[size] 是模型输入边长。
   void _publishAlpha(Float32List a, int size) {
     if (_alphaImgBusy) return;
     _alphaImgBusy = true;
@@ -334,6 +335,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       px[o++] = v;
     }
     final seq = ++_alphaSeq;
+    // ★放大到 1024² 再给 GPU：ShaderMask 的 ImageShader 默认 FilterQuality.none
+    //   （最近邻），256² 直接铺到 ~1600 物理像素的方块上会看到 ~5px 的方块台阶；
+    //   让 decode 时插值放大到 1024²，台阶降到 ~1.5px，肉眼基本看不出。
+    //   （自己不用写放大循环，交给 C++ 侧的解码器）
+    const maskSize = 1024;
     ui.decodeImageFromPixels(px, size, size, ui.PixelFormat.rgba8888, (img) {
       _alphaImgBusy = false;
       if (!mounted || seq != _alphaSeq) {
@@ -346,7 +352,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (oldA != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) => oldA.dispose());
       }
-    });
+    }, targetWidth: maskSize, targetHeight: maskSize);
   }
 
   /// 遮罩矩阵：把 256² 的 alpha 摆到屏幕上"人像所在的那个方块"。
@@ -613,8 +619,12 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               _prevAlpha = a;
               _aiFrames++; // AI 推理成功一帧（供 fps 角标结算）
               _updateAiDiag(a, size);
-              // ★B：把 alpha 发成 256² 小图给 GPU 当遮罩
-              if (kGpuComposite) _publishAlpha(a, size);
+              // ★B：把 alpha 发成小图给 GPU 当遮罩。
+              //   ★必须先用 shapeAlpha 整形（区域清理 + 羽化 + 强度映射），
+              //     否则边缘是一圈锯齿 —— 老 CPU 路径的清晰度就来自这一步。
+              if (kGpuComposite) {
+                _publishAlpha(shapeAlpha(a, size, size, widget.strength), size);
+              }
             } else if (eng.errorStreak > 0) {
               // 引擎「忙」不是错误；只有真的连续报错才计数 → 到阈值熔断
               _noteAiFailure();
@@ -1115,8 +1125,18 @@ Uint8List _largestComponent(Uint8List bin, int w, int h) {
 /// 竖屏时垂直被拉 1.78 倍 + 旋转 90° 错位 → 表现就是"只有脸中心一小块抠出来，
 /// 四周全是糊的紫色渐变"。这里对每个原始像素做逆变换（原始→转正→裁方窗口→
 /// alpha 坐标）再采样；窗口外的像素（裁方丢掉的上下/左右）直接算背景。
-void _applySoftAlpha(Uint8List rgba, Float32List alpha, int aw, int ah,
-    double strength, int w, int h, int rotDeg) {
+/// 把模型输出的 256² 软 alpha 整形成"可直接上屏/当遮罩"的 alpha。
+///
+/// 四步（全部在 256² 上做，≈6.5 万像素，开销可忽略）：
+///  ① 半分辨率区域清理：去掉书架/墙等被误判成人的孤立块（dilate→erode→去边缘长条→保留最大连通块）
+///  ② keep 硬切：把清理判定为背景的格子 alpha 归零
+///  ③ 3×3 盒式羽化：**这步是锯齿/闪烁的直接解药** —— 256 放大到 1080p 是 4 倍，
+///     不羽化的话硬边会被放大成肉眼可见的大台阶
+///  ④ 强度映射：strength 越大，低 alpha 越容易被压到 0（抠得越狠）
+///
+/// ★老 CPU 合成路径与新的 GPU 遮罩路径**必须共用这一套**，否则两条路的边缘观感不一致
+///   （B 方案第一版就是漏了这步，真机上边缘是一圈大锯齿）。
+Float32List shapeAlpha(Float32List alpha, int aw, int ah, double strength) {
   // ---- ① 半分辨率区域清理（去掉书架/墙等被误判为人的孤立块）----
   final hw = aw >> 1, hh = ah >> 1;
   Uint8List keep = Uint8List(0);
@@ -1187,6 +1207,15 @@ void _applySoftAlpha(Uint8List rgba, Float32List alpha, int aw, int ah,
       blurred[p] = v <= 0 ? 0.0 : (v >= 1 ? 1.0 : v);
     }
   }
+
+  return blurred;
+}
+
+void _applySoftAlpha(Uint8List rgba, Float32List alpha, int aw, int ah,
+    double strength, int w, int h, int rotDeg) {
+  // ---- ①~④ 整形统一在模型分辨率（256²）上做，与 GPU 遮罩路径共用同一套，
+  //   保证「CPU 合成」和「GPU 遮罩」两种出画的观感一致 ----
+  final blurred = shapeAlpha(alpha, aw, ah, strength);
 
   // ---- ⑤ 逆变换贴回全分辨率：原始像素 → 转正坐标 → 裁方窗口 → alpha 坐标 ----
   // 与 _sampleSquareRgb 的正向变换互逆：
