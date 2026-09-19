@@ -324,23 +324,53 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// [a] 必须是**已经 shapeAlpha 整形过**的 alpha（观感靠它），[size] 是模型输入边长。
   void _publishAlpha(Float32List a, int size) {
     if (_alphaImgBusy) return;
+    // 遮罩图要覆盖**整幅画面**（不再只是中间那个方块）：
+    // 取与转正画面同长宽比的小图（长边 256），逐点反查 alpha（双线性），
+    // 发布时再由 decode 插值放大到 4 倍 —— 这样画面每一块都能拿到 alpha。
+    final swap = ((360 - _frameOrientation) % 360) % 180 != 0;
+    final f = _frameSize;
+    final uw = (swap ? f.height : f.width).round();
+    final uh = (swap ? f.width : f.height).round();
+    if (uw <= 0 || uh <= 0) return;
+    final mw = uw >= uh ? 256 : math.max(8, (256 * uw / uh).round());
+    final mh = uh >= uw ? 256 : math.max(8, (256 * uh / uw).round());
+    final af = sampleAffine(uw, uh, size, true);
+    final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
     _alphaImgBusy = true;
-    // 预乘白：RGB 与 A 同值，遮罩只看 alpha 通道，颜色无所谓
-    final px = Uint8List(size * size * 4);
-    for (int i = 0, o = 0; i < a.length; i++) {
-      final v = (a[i] * 255.0).clamp(0.0, 255.0).toInt();
-      px[o++] = v;
-      px[o++] = v;
-      px[o++] = v;
-      px[o++] = v;
+    final px = Uint8List(mw * mh * 4);
+    final awf = size - 1;
+    for (int my = 0, o = 0; my < mh; my++) {
+      final uy = my * uh / mh;
+      final ay = (uy - aY) / bY; // 画面坐标 → 模型坐标
+      var y0 = ay.floor();
+      if (y0 < 0) y0 = 0;
+      if (y0 > awf) y0 = awf;
+      final y1 = y0 + 1 <= awf ? y0 + 1 : awf;
+      final ty = (ay - y0).clamp(0.0, 1.0);
+      for (int mx = 0; mx < mw; mx++) {
+        final ux = mx * uw / mw;
+        final ax = (ux - aX) / bX;
+        var x0 = ax.floor();
+        if (x0 < 0) x0 = 0;
+        if (x0 > awf) x0 = awf;
+        final x1 = x0 + 1 <= awf ? x0 + 1 : awf;
+        final tx = (ax - x0).clamp(0.0, 1.0);
+        final t0 = a[y0 * size + x0] + (a[y0 * size + x1] - a[y0 * size + x0]) * tx;
+        final t1 = a[y1 * size + x0] + (a[y1 * size + x1] - a[y1 * size + x0]) * tx;
+        final v = ((t0 + (t1 - t0) * ty) * 255.0).clamp(0.0, 255.0).toInt();
+        // 预乘白：RGB 与 A 同值，遮罩只看 alpha 通道
+        px[o++] = v;
+        px[o++] = v;
+        px[o++] = v;
+        px[o++] = v;
+      }
     }
     final seq = ++_alphaSeq;
     // ★放大到 1024² 再给 GPU：ShaderMask 的 ImageShader 默认 FilterQuality.none
     //   （最近邻），256² 直接铺到 ~1600 物理像素的方块上会看到 ~5px 的方块台阶；
     //   让 decode 时插值放大到 1024²，台阶降到 ~1.5px，肉眼基本看不出。
     //   （自己不用写放大循环，交给 C++ 侧的解码器）
-    const maskSize = 1024;
-    ui.decodeImageFromPixels(px, size, size, ui.PixelFormat.rgba8888, (img) {
+    ui.decodeImageFromPixels(px, mw, mh, ui.PixelFormat.rgba8888, (img) {
       _alphaImgBusy = false;
       if (!mounted || seq != _alphaSeq) {
         img.dispose();
@@ -352,32 +382,33 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (oldA != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) => oldA.dispose());
       }
-    }, targetWidth: maskSize, targetHeight: maskSize);
+    }, targetWidth: mw * 4, targetHeight: mh * 4);
   }
 
-  /// 遮罩矩阵：把 256² 的 alpha 摆到屏幕上"人像所在的那个方块"。
+  /// 遮罩矩阵：把遮罩图（与转正画面同长宽比）摆到屏幕上画面所在的那个矩形。
   ///
-  /// 模型看到的是「转正后居中裁方」的画面，边长 S = min(转正宽, 转正高)；
-  /// 屏幕上画面按 cover 比例 k 铺满控件，所以那个方块在屏幕上是边长 S*k 的居中正方形。
-  /// 前置还要跟着镜像，否则遮罩和人像左右会差开。
+  /// 画面按 cover 比例 k 铺满控件，所以它的屏幕矩形是 `rw*k × rh*k` 居中（比控件大）。
+  /// 遮罩图覆盖整幅画面 → 直接线性映射到这个矩形即可，不需要再算什么"中间方块"。
+  /// 前置要跟着镜像，否则遮罩和人像左右会差开。
   Matrix4 _maskMatrix(double viewW, double viewH, int rotDeg, bool mirror,
-      int alphaSize) {
+      int imgW, int imgH) {
     final f = _frameSize;
-    if (f.width <= 0 || f.height <= 0 || alphaSize <= 0) return Matrix4.identity();
+    if (f.width <= 0 || f.height <= 0 || imgW <= 0 || imgH <= 0) {
+      return Matrix4.identity();
+    }
     final swap = rotDeg == 90 || rotDeg == 270;
     final rw = swap ? f.height : f.width; // 转正后的宽
     final rh = swap ? f.width : f.height; // 转正后的高
     final k = math.max(viewW / rw, viewH / rh); // cover 比例
-    final s = math.min(rw, rh) * k; // 人像方块在屏幕上的边长
-    // 直接把矩阵写出来（不走 translate/scale 链，精确且无弃用告警）：
-    // 把 alpha 图（alphaSize 见方）线性映射到屏幕上那个居中方块；
-    // 前置镜像时 x 轴反向，原点挪到方块右边缘。
-    final sc = s / alphaSize;
+    final rectW = rw * k, rectH = rh * k;
+    final left = (viewW - rectW) / 2, top = (viewH - rectH) / 2;
+    final sx = rectW / imgW, sy = rectH / imgH;
+    // 直接把矩阵写出来（不走 translate/scale 链，精确且无弃用告警）
     final m = Matrix4.identity();
-    m.setEntry(0, 0, mirror ? -sc : sc);
-    m.setEntry(1, 1, sc);
-    m.setEntry(0, 3, mirror ? viewW / 2 + s / 2 : viewW / 2 - s / 2);
-    m.setEntry(1, 3, viewH / 2 - s / 2);
+    m.setEntry(0, 0, mirror ? -sx : sx);
+    m.setEntry(1, 1, sy);
+    m.setEntry(0, 3, mirror ? left + rectW : left);
+    m.setEntry(1, 3, top);
     return m;
   }
 
@@ -467,7 +498,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           alpha,
           TileMode.clamp,
           TileMode.clamp,
-          _maskMatrix(bounds.width, bounds.height, rotDeg, mirror, alpha.width)
+          _maskMatrix(bounds.width, bounds.height, rotDeg, mirror, alpha.width,
+                  alpha.height)
               .storage,
         ),
         child: person,
@@ -587,7 +619,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         //   否则模型看到的是侧躺的人，抠像质量会明显变差。
         final rgb = _aiRgbOf(size);
         final rotDeg = (360 - orientation) % 360;
-        _sampleSquareRgb(rgba, w, h, rotDeg, size, rgb);
+        // ★GPU 路径用 fit（整幅缩进方形，画面全覆盖）；老 CPU 路径保持居中裁方不动
+        _sampleSquareRgb(rgba, w, h, rotDeg, size, rgb, fit: kGpuComposite);
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
 
         // ---- ★★ 出画与推理解耦（不然手机端会掉成幻灯片）★★ ----
@@ -843,6 +876,27 @@ void _nv21ToRgbaInto(Uint8List nv21, int w, int h, Uint8List out) {
   }
 }
 
+/// 计算「模型输入坐标 → 转正画面坐标」的仿射参数，返回 `[aX, bX, aY, bY]`，
+/// 即 `画面坐标 = a + b × 模型坐标`。正/反向映射、遮罩图都从这里取，保证三处一致。
+///
+/// * `fit = false`：**居中裁方**（老行为）—— 画面上下各 22% 不在模型视野内，会被抠成背景
+/// * `fit = true` ：**整幅缩进方形 + 四周留边** —— 画面 100% 在模型视野内（B 方案用这个）
+List<double> sampleAffine(int uw, int uh, int size, bool fit) {
+  if (fit) {
+    final sc = size / (uw > uh ? uw : uh); // 模型像素 / 画面像素
+    return <double>[
+      -(size - uw * sc) / 2 / sc, 1 / sc, //
+      -(size - uh * sc) / 2 / sc, 1 / sc, //
+    ];
+  }
+  final side = uw < uh ? uw : uh;
+  final step = side / size;
+  return <double>[
+    (uw - side) / 2.0, step, //
+    (uh - side) / 2.0, step, //
+  ];
+}
+
 /// 从全分辨率 RGBA 取一块「转正 + 居中裁方 + 缩放到 size×size」的 RGB，
 /// 写入 [out]（长度 size*size*3）。这是喂给 MODNet 的输入。
 ///
@@ -850,22 +904,28 @@ void _nv21ToRgbaInto(Uint8List nv21, int w, int h, Uint8List out) {
 ///   「侧躺的人」，抠像质量明显下降（漏抠、把背景圈进人像）。
 /// ★为什么居中裁方：MODNet 是方形输入，直接拉伸会把竖幅人像压扁变型；
 ///   居中裁方保住真实比例，代价是画面上下被裁（直播时人像本来居中，影响很小）。
-void _sampleSquareRgb(
-    Uint8List rgba, int w, int h, int rotDeg, int size, Uint8List out) {
+void _sampleSquareRgb(Uint8List rgba, int w, int h, int rotDeg, int size,
+    Uint8List out, {bool fit = false}) {
   // 转正后的尺寸
   final swap = rotDeg == 90 || rotDeg == 270;
   final uw = swap ? h : w;
   final uh = swap ? w : h;
-  final side = uw < uh ? uw : uh;
-  final cropX = (uw - side) / 2.0;
-  final cropY = (uh - side) / 2.0;
-  final step = side / size;
+  final af = sampleAffine(uw, uh, size, fit);
+  final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
 
   int o = 0;
   for (int oy = 0; oy < size; oy++) {
-    final uy = cropY + oy * step;
+    final uy = aY + oy * bY;
+    // fit 模式下留边处没有画面内容 → 填中性灰（归一化后 ≈0，模型当背景）
+    final rowPad = fit && (uy < 0 || uy > uh - 1);
     for (int ox = 0; ox < size; ox++) {
-      final ux = cropX + ox * step;
+      final ux = aX + ox * bX;
+      if (rowPad || ux < 0 || ux > uw - 1) {
+        out[o++] = 128;
+        out[o++] = 128;
+        out[o++] = 128;
+        continue;
+      }
       // 转正坐标 → 原始 buffer 坐标（90/180/270° 都是仿射变换，
       // 所以直接在原始坐标里做双线性采样，结果与"先转正再插值"等价）
       double rfx, rfy;
