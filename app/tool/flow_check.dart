@@ -207,5 +207,35 @@ void main() {
     print('  ⏱  平均 ${(sw.elapsedMicroseconds / iters / 1000).toStringAsFixed(1)}ms/次（PC）；'
         '手机约 3~5 倍 → 3~5ms，alpha 每 250ms 一次，占比 <2%');
   }
+  // ---------- 7) 人像区域整体平移（两次 alpha 之间的连续跟随）----------
+  {
+    final prev = makeBase(7);
+    paintPatch(prev, 30, 80); // 把人放在 (30,80) 起的 32x32
+    final cur = shift(prev, 5, -4); // 整幅平移 (5,-4)
+    final wt = Uint8List(W * H);
+    for (var y = 78; y < 114; y++) {
+      for (var x = 28; x < 64; x++) {
+        wt[y * W + x] = 1;
+      }
+    }
+    final s = estimateMaskShift(prev, cur, W, H, wt, 18);
+    if (s == null) {
+      check('人像整体平移', false, '返回 null');
+    } else {
+      check(
+          '人像整体平移 (${s.dx.toStringAsFixed(1)},${s.dy.toStringAsFixed(1)})',
+          (s.dx - 5).abs() < 2 && (s.dy + 4).abs() < 2,
+          '应≈(5,-4) 灰度像素');
+    }
+    // 静止 → 不应补偿
+    final s2 = estimateMaskShift(prev, Uint8List.fromList(prev), W, H, wt, 18);
+    check(
+        '人像静止 → 不补偿',
+        s2 == null || s2.magnitude < 1.5,
+        s2 == null
+            ? '返回 null ✓'
+            : '(${s2.dx.toStringAsFixed(1)},${s2.dy.toStringAsFixed(1)})');
+  }
+
   print(fails == 0 ? '=== 全部通过 ===' : '=== 有 $fails 项未通过 ===');
 }

@@ -37,7 +37,7 @@ const int kAiInputWidth = 192;
 
 /// ★诊断开关：把"模型看到的画面"按**遮罩同一套映射**半透明叠到实时预览上。
 /// 用来直接测量"预览纹理的真实映射"与"代码假设映射"的偏差（偏移/缩放/镜像）。
-/// 只在排障期开，配 kDiagLogOn 一起关。
+/// 只在排障期开，配 _diagOn 一起关。
 const bool kDiagOverlayInput = false;
 
 /// 叠加时同时画"镜像后"的那一套（绿色），用于一眼判断该用哪套映射。
@@ -132,6 +132,19 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   final Float32List _flowTmp = Float32List(2);
   int _flowMs = 0;
   String _flowDbg = '';
+
+  // ---- ★两次 alpha 之间的"连续跟随"（治"人一动就露出大块背景"）----
+  Uint8List? _maskBaseGray; // 已发布遮罩对应的那一帧的灰度（拷贝）
+  Uint8List? _maskWeight; // 人像区域权重（灰度分辨率；1=人）
+  GlobalShift? _liveShift; // 本帧估出的"人像整体位移"（灰度像素）
+  bool _liveShiftMs = false; // 本帧是否真的做了跟随（诊断标记，放 HUD）
+
+  /// ★运行时诊断开关：默认关（画面干净、也省 CPU）。
+  /// **长按右上角"AI 抠像 x.xfps"角标**即可随时开/关 ——
+  /// 这样发出去的干净版本身仍带着诊断能力，我随时能让老板长按一下取证，
+  /// 不用为每轮排查单独出一个诊断包。
+  // 默认关（画面干净、省 CPU）；长按角标可开。想强制打开就把这行改成 true。
+  bool _diagOn = false;
   String _dispDbg = ''; // 显示几何（帧尺寸/朝向/显示旋转/视图尺寸）——排障一眼看
   double _emaW = 0.65; // 本帧采用的平滑权重（排障可见）
   ui.Image? _frame;
@@ -151,7 +164,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
 
   /// ★端侧排障面板文本。容器里没有 logcat、HTTP 信标也打不出去
   /// （容器网络 NAT 隔离，ping 通但 TCP 不通），所以"错误上屏 + 截图"
-  /// 是唯一能把真实现场带回电脑的通道。排障期显示，发版靠 kDiagLogOn 关掉。
+  /// 是唯一能把真实现场带回电脑的通道。排障期显示，发版靠 _diagOn 关掉。
   String _dbgPanel = '';
 
   // ===== ★地面真相可视化：模型输入 + 模型原始输出（都只给排障用）=====
@@ -167,7 +180,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
 
   /// 把「模型输入」与「模型原始输出」各做一张小图，画在屏幕上。
   void _dbgMakeImages() {
-    if (!kDiagLogOn) return;
+    if (!_diagOn) return;
     final rgb = _dbgInRgb, a = _dbgRawA;
     final w = _dbgInW, h = _dbgInH;
     if (rgb == null || a == null || w <= 0 || h <= 0) return;
@@ -214,7 +227,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   }
 
   void _dbg(String what) {
-    if (!kDiagLogOn) return;
+    if (!_diagOn) return;
     final e = _engine;
     final buf = <String>[
       '$what',
@@ -522,7 +535,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     final mh = uh >= uw ? kMaskLong : math.max(8, (kMaskLong * uh / uw).round());
     final af = sampleAffine(uw, uh, aw, ah);
     final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
-    if (kDiagLogOn) {
+    if (_diagOn) {
       final rd = (360 - _frameOrientation) % 360;
       final pv = _camera?.value.previewSize;
       _geoDbg = '预览分辨率 $pv | 帧buffer ${f.width.toInt()}x${f.height.toInt()}'
@@ -663,6 +676,58 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     _maskDbg = '$_maskDbg  $_flowDbg ${_flowMs}ms';
   }
 
+  /// 两次 alpha 之间的**连续跟随**：只估"人像区域"的整体位移，每显示帧一次。
+  ///
+  /// 为什么必须有它：alpha 只有 ~3fps（350ms 一张）。两张之间人还在动，
+  /// 遮罩却停在原地 —— 那段空档就是"人一动就露出的大块背景"。
+  /// 这里用 ~12fps 的频率把已发布的遮罩整体挪一下，跟随频率提高约 4 倍。
+  void _updateLiveShift() {
+    if (!kMotionComp) return;
+    final bg = _maskBaseGray, cg = _grayCur, wt = _maskWeight;
+    if (bg == null || cg == null || wt == null || bg.length != cg.length) {
+      _liveShift = null;
+      _liveShiftMs = false;
+      return;
+    }
+    final s = estimateMaskShift(bg, cg, _grayW, _grayH, wt, 18);
+    _liveShift = s;
+    _liveShiftMs = s != null;
+  }
+
+  /// 记下"这张遮罩是相对哪一帧算的"（灰度拷贝 + 人像权重），供连续跟随用。
+  /// 发布新遮罩后必须调一次，否则跟随会基于旧基准、把位移重复叠加。
+  void _refreshMaskBase(Float32List alpha, int aw, int ah) {
+    final cg = _grayCur;
+    if (!kMotionComp ||
+        cg == null ||
+        _grayW <= 0 ||
+        _grayH <= 0 ||
+        alpha.length < aw * ah) {
+      _maskBaseGray = null;
+      _maskWeight = null;
+      _liveShift = null;
+      return;
+    }
+    _maskBaseGray = Uint8List.fromList(cg);
+    final wt = (_maskWeight != null && _maskWeight!.length == cg.length)
+        ? _maskWeight!
+        : (_maskWeight = Uint8List(cg.length));
+    final sx = aw / _grayW, sy = ah / _grayH;
+    for (var y = 0; y < _grayH; y++) {
+      var ay = (y * sy).toInt();
+      if (ay >= ah) ay = ah - 1;
+      final row = y * _grayW;
+      final arow = ay * aw;
+      for (var x = 0; x < _grayW; x++) {
+        var ax = (x * sx).toInt();
+        if (ax >= aw) ax = aw - 1;
+        wt[row + x] = alpha[arow + ax] > 0.5 ? 1 : 0;
+      }
+    }
+    _liveShift = null;
+    _liveShiftMs = false;
+  }
+
   /// 用运动场把 alpha 从「推理那一帧」外推到「当前帧」。
   ///
   /// 位移 v = 内容从旧帧到新帧的位移（见 MotionField 的说明），
@@ -701,8 +766,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 画面按 cover 比例 k 铺满控件，所以它的屏幕矩形是 `rw*k × rh*k` 居中（比控件大）。
   /// 遮罩图覆盖整幅画面 → 直接线性映射到这个矩形即可，不需要再算什么"中间方块"。
   /// 前置要跟着镜像，否则遮罩和人像左右会差开。
+  /// [shiftU]/[shiftV]：把遮罩图整体平移多少（**遮罩图像素**），
+  /// 用于两次 alpha 之间的连续跟随（见 _updateLiveShift）。
   Matrix4 _maskMatrix(double viewW, double viewH, int rotDeg, bool mirror,
-      int imgW, int imgH) {
+      int imgW, int imgH,
+      {double shiftU = 0, double shiftV = 0}) {
     final f = _frameSize;
     if (f.width <= 0 || f.height <= 0 || imgW <= 0 || imgH <= 0) {
       return Matrix4.identity();
@@ -718,8 +786,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     final m = Matrix4.identity();
     m.setEntry(0, 0, mirror ? -sx : sx);
     m.setEntry(1, 1, sy);
-    m.setEntry(0, 3, mirror ? left + rectW : left);
-    m.setEntry(1, 3, top);
+    // 跟随平移：新帧 (u,v) 取旧遮罩 (u-shift) 处的值 ⇒ 图像整体移动 +shift。
+    // 镜像时符号翻转（画布 X 已经被翻过）。
+    m.setEntry(0, 3, (mirror ? left + rectW : left) +
+        (mirror ? sx * shiftU : -sx * shiftU));
+    m.setEntry(1, 3, top - sy * shiftV);
     return m;
   }
 
@@ -826,8 +897,20 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
             alpha,
             TileMode.clamp,
             TileMode.clamp,
-            _maskMatrix(bounds.width, bounds.height, rotDeg, mirror,
-                    alpha.width, alpha.height)
+            _maskMatrix(
+                    bounds.width,
+                    bounds.height,
+                    rotDeg,
+                    mirror,
+                    alpha.width,
+                    alpha.height,
+                    // 灰度位移 → 遮罩图像素：遮罩图覆盖整幅画面，与灰度图同长宽比
+                    shiftU: _liveShiftMs
+                        ? _liveShift!.dx * alpha.width / _grayW
+                        : 0,
+                    shiftV: _liveShiftMs
+                        ? _liveShift!.dy * alpha.height / _grayH
+                        : 0)
                 .storage,
             // ★双线性插值：ImageShader 默认是最近邻，遮罩铺到 ~1600 物理像素会看到
             //   方块台阶。用 medium 让边缘平滑，也就不必再把遮罩放大 4 倍
@@ -846,7 +929,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 若它与实时画面里的人和物重合 → 预览映射与假设一致（问题在别处）；
   /// 若整体错开/缩放 → 一眼就能读出偏移量。
   Widget _withDiagOverlay(Widget child, int rotDeg, bool mirror) {
-    if (!kDiagLogOn || !kDiagOverlayInput) return child;
+    if (!_diagOn || !kDiagOverlayInput) return child;
     return LayoutBuilder(builder: (BuildContext ctx, BoxConstraints c) {
       // 红 = 代码当前用的映射（mirror）；绿 = 镜像后的映射。
       // 谁和实时画面的人重合，就说明该用哪一套 —— 一次截图即可定性。
@@ -999,7 +1082,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         final rotDeg = kGpuComposite ? orientation : (360 - orientation) % 360;
         _sampleSquareRgb(rgba, fw, fh, rotDeg, iw, ih, rgb);
         // ★运动补偿：顺手做一张一半大小的灰度图（每帧一遍、零分配）
-        if (kMotionComp) _buildGray(rgb, iw, ih);
+        if (kMotionComp) {
+          _buildGray(rgb, iw, ih);
+          // ★每帧估一次"人像整体位移" —— 两次 alpha 之间的空档靠它顶住
+          _updateLiveShift();
+        }
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
         // ★运动量：与上一帧输入图逐点比较（跳点采样，开销可忽略）
         final prevRgb = _prevAiRgb;
@@ -1015,7 +1102,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           _motion = acc / (rgb.length / 97) / 255.0;
         }
         _prevAiRgb!.setAll(0, rgb);
-        if (kDiagLogOn && !_aiReqPending) {
+        if (_diagOn && !_aiReqPending) {
           // ★存到"待发"槽位：等结果回来时和输出**成对**上屏，
           //   否则左右两张图可能相差半秒（晃动时就显得"输出不准"）。
           _dbgPendIn = Uint8List.fromList(rgb);
@@ -1044,7 +1131,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
             if (!mounted || myGen != _camGen) return;
             if (a != null && a.length == iw * ih) {
               _aiFail = 0; // ★跑通了 → 连续失败计数清零
-              if (kDiagLogOn) {
+              if (_diagOn) {
                 // ★成对：这一帧的输入 + 这一帧的原始输出，同一次请求
                 final pi = _dbgPendIn;
                 if (pi != null) {
@@ -1098,6 +1185,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
                 final fl = _flow;
                 if (fl != null) alpha = _warpAlpha(alpha, iw, ih, fl);
                 _publishAlpha(alpha, iw, ih);
+                // ★这张遮罩是"相对当前帧"算的 → 把当前帧设为连续跟随的新基准
+                _refreshMaskBase(alpha, iw, ih);
               }
             } else if (eng.errorStreak > 0) {
               // 引擎「忙」不是错误；只有真的连续报错才计数 → 到阈值熔断
@@ -1200,14 +1289,15 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
 
   @override
   Widget build(BuildContext context) {
-    if (kDiagLogOn && _hasFrame) {
+    if (_diagOn && _hasFrame) {
       final vs = MediaQuery.sizeOf(context);
       _dispDbg = '几何 帧${_frameSize.width.toInt()}x${_frameSize.height.toInt()}'
           ' img${_frame?.width}x${_frame?.height}'
           ' 朝向$_frameOrientation 显示转${((_frameOrientation ~/ 90) % 4) * 90}°'
           ' 镜像${widget.mirror && _frameMirror ? 1 : 0}'
           ' 视图${vs.width.toInt()}x${vs.height.toInt()}'
-          ' 输入${_aiInW}x$_aiInH';
+          ' 输入${_aiInW}x$_aiInH'
+          '${_liveShiftMs ? ' 跟随${_liveShift!.dx.toStringAsFixed(1)},${_liveShift!.dy.toStringAsFixed(1)}' : ' 跟随-'}';
     }
     // 色布模式仍走 CPU 色键（遮罩那套只服务 AI 抠像）
     final onGpu = kGpuComposite && _camera != null &&
@@ -1235,7 +1325,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         ),
       ),
       // ★地面真相面板：模型输入 vs 模型原始输出（同尺寸并排，人像对不齐就说明是模型/采样问题）
-      if (kDiagLogOn && (_dbgImgIn != null || _dbgImgA != null))
+      if (_diagOn && (_dbgImgIn != null || _dbgImgA != null))
         Positioned(
           top: MediaQuery.paddingOf(context).top + 104,
           left: 8,
@@ -1272,7 +1362,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           ),
         ),
       // ★端侧排障面板（底部）：把引擎真实错误显示在画面上，供截图回传
-      if (kDiagLogOn && _dbgPanel.isNotEmpty)
+      if (_diagOn && _dbgPanel.isNotEmpty)
         Positioned(
           left: 6,
           right: 6,
@@ -1296,7 +1386,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         Positioned(
           top: MediaQuery.paddingOf(context).top + 6,
           right: 10,
-          child: Container(
+          child: GestureDetector(
+            // ★长按这个角标 = 开/关诊断（两张小图 + 底部面板 + 几何行）。
+            //   默认关：画面干净、少占 CPU；需要取证时随时长按打开。
+            onLongPress: () => setState(() => _diagOn = !_diagOn),
+            child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
             decoration: BoxDecoration(
               color: Colors.black.withValues(alpha: .38),
@@ -1304,9 +1398,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
             ),
             child: Text(
               'AI 抠像 ${_aiFps.toStringAsFixed(1)}fps · '
-              '输入${_engine!.inputW}×${_engine!.inputH}',
+              '输入${_engine!.inputW}×${_engine!.inputH}'
+              '${_diagOn ? ' · 诊断开' : ''}',
               style: const TextStyle(
                   color: Colors.white70, fontSize: 9, height: 1.2),
+            ),
             ),
           ),
         ),

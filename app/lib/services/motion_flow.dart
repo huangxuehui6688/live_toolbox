@@ -392,3 +392,101 @@ class MotionEstimator {
     );
   }
 }
+
+
+/// 人像区域的**整体平移**（加权 SAD）。
+///
+/// **用途**：alpha 只有 ~3fps（每 350ms 才来一张）。两张 alpha 之间人还在动，
+/// 这段空档里遮罩一直停在老位置 —— 表现就是"人一动就露出大块背景"。
+/// 这里每个显示帧（~12fps）估一次**人像区域的整体位移**，把已发布的遮罩整体挪一下，
+/// 让遮罩在两次 alpha 之间也跟着人走（跟随频率提高约 4 倍）。
+///
+/// 为什么只做整体平移：人的位移主要成分是"整体在动"；手臂这类局部形变交给
+/// [MotionEstimator.estimate]（alpha 到手时那种逐块运动场）。**便宜、稳、不乱形变**。
+class GlobalShift {
+  GlobalShift(this.dx, this.dy, this.gain);
+
+  /// 灰度图像素；正 = 内容向右/下移动
+  final double dx;
+  final double dy;
+
+  /// 0~1：相对"不动"的改善比例（诊断用）
+  final double gain;
+
+  double get magnitude => math.sqrt(dx * dx + dy * dy);
+}
+
+/// 只统计"人"所在区域（[weight] > 0）的整体平移。
+/// [radius] 搜索半径（灰度像素）。人像样本少于 40 个、或没找到明显位移时返回 null。
+GlobalShift? estimateMaskShift(
+  Uint8List prev,
+  Uint8List cur,
+  int w,
+  int h,
+  Uint8List weight,
+  int radius,
+  ) {
+  if (prev.length < w * h || cur.length < w * h || weight.length < w * h) {
+    return null;
+  }
+  // ---- 采样点：只要"人"所在像素，隔 2 取 1 ----
+  final pxs = <int>[];
+  final pys = <int>[];
+  for (var y = radius; y < h - radius; y += 2) {
+    final row = y * w;
+    for (var x = radius; x < w - radius; x += 2) {
+      if (weight[row + x] == 0) continue;
+      pxs.add(x);
+      pys.add(y);
+    }
+  }
+  final n = pxs.length;
+  if (n < 40) return null;
+  final pv = Int32List(n);
+  for (var i = 0; i < n; i++) {
+    pv[i] = prev[pys[i] * w + pxs[i]];
+  }
+
+  int sadAt(int vx, int vy) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+      s += (pv[i] - cur[(pys[i] + vy) * w + pxs[i] + vx]).abs();
+    }
+    return s;
+  }
+
+  final sad0 = sadAt(0, 0);
+  var costMin = sad0.toDouble();
+  var sadMin = sad0;
+  var bx = 0, by = 0;
+  // 粗搜：步长 2 + 一点"偏爱不动"（压住重复纹理凑出来的假匹配）
+  for (var vy = -radius; vy <= radius; vy += 2) {
+    for (var vx = -radius; vx <= radius; vx += 2) {
+      if (vx == 0 && vy == 0) continue;
+      final s = sadAt(vx, vy);
+      final c = s + (vx.abs() + vy.abs()) * n * 0.2;
+      if (c < costMin) {
+        costMin = c;
+        sadMin = s;
+        bx = vx;
+        by = vy;
+      }
+    }
+  }
+  // 精修：在粗搜最优点 ±1 内用**纯 SAD**定胜负（保证 1 像素精度）
+  final ax = bx, ay = by;
+  for (var vy = -1; vy <= 1; vy++) {
+    for (var vx = -1; vx <= 1; vx++) {
+      if (vx == 0 && vy == 0) continue;
+      final s = sadAt(ax + vx, ay + vy);
+      if (s < sadMin) {
+        sadMin = s;
+        bx = ax + vx;
+        by = ay + vy;
+      }
+    }
+  }
+  final gain = sad0 == 0 ? 0.0 : 1.0 - sadMin / sad0;
+  if (gain < 0.04) return null; // 没找到明显位移 → 不补偿
+  return GlobalShift(bx.toDouble(), by.toDouble(), gain > 1 ? 1.0 : gain);
+}
