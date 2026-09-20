@@ -107,6 +107,9 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   Float32List? _prevAlpha;
   /// 是否有一次推理还在路上（在途时不再发新请求 → 天然跳帧，出画不被阻塞）
   bool _aiReqPending = false;
+  Uint8List? _prevAiRgb; // 上一帧模型输入（算运动量用）
+  double _motion = 0; // 帧间运动量（0~1，粗估：输入图相邻帧平均差）
+  double _emaW = 0.65; // 本帧采用的平滑权重（排障可见）
   ui.Image? _frame;
   bool _busy = false;
   String _status = '初始化中…';
@@ -128,6 +131,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   String _dbgPanel = '';
 
   // ===== ★地面真相可视化：模型输入 + 模型原始输出（都只给排障用）=====
+  Uint8List? _dbgPendIn; // 在途请求的输入副本（结果回来才上屏，保证成对）
+  int _dbgPendW = 0, _dbgPendH = 0;
   Uint8List? _dbgInRgb; // 最近一次真正喂给模型的 RGB 副本
   int _dbgInW = 0, _dbgInH = 0;
   Float32List? _dbgRawA; // 最近一次模型原始输出（未经 EMA / shapeAlpha）
@@ -194,6 +199,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           '提供器=${e?.diag ?? "-"}',
       'fail=$_aiFail/$kAiFailLimit 加载失败=$_loadFails 在途=$_aiReqPending '
           '成功帧=$_aiFrames 整幅=$gFullFrameInput aiIn=$_aiInW x$_aiInH',
+      '运动=${_motion.toStringAsFixed(3)} 平滑权重=${_emaW.toStringAsFixed(2)} '
+          'AI fps=${_aiFps.toStringAsFixed(1)}',
     ];
     final er = e?.lastError ?? '';
     if (er.isNotEmpty) buf.add('ERR: $er');
@@ -837,11 +844,26 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         final rotDeg = kGpuComposite ? orientation : (360 - orientation) % 360;
         _sampleSquareRgb(rgba, fw, fh, rotDeg, iw, ih, rgb);
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
+        // ★运动量：与上一帧输入图逐点比较（跳点采样，开销可忽略）
+        final prevRgb = _prevAiRgb;
+        if (prevRgb == null || prevRgb.length != rgb.length) {
+          _prevAiRgb = Uint8List(rgb.length); // 复用缓冲，避免每帧 200KB 垃圾
+          _motion = 0;
+        } else {
+          var acc = 0;
+          for (int i = 0; i < rgb.length; i += 97) {
+            final d = (rgb[i] - prevRgb[i]).abs();
+            acc += d;
+          }
+          _motion = acc / (rgb.length / 97) / 255.0;
+        }
+        _prevAiRgb!.setAll(0, rgb);
         if (kDiagLogOn && !_aiReqPending) {
-          // 留一份给"地面真相"面板（复用缓冲会被下一帧覆盖）
-          _dbgInRgb = Uint8List.fromList(rgb);
-          _dbgInW = iw;
-          _dbgInH = ih;
+          // ★存到"待发"槽位：等结果回来时和输出**成对**上屏，
+          //   否则左右两张图可能相差半秒（晃动时就显得"输出不准"）。
+          _dbgPendIn = Uint8List.fromList(rgb);
+          _dbgPendW = iw;
+          _dbgPendH = ih;
         }
 
         // ---- ★★ 出画与推理解耦（不然手机端会掉成幻灯片）★★ ----
@@ -862,16 +884,43 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
             if (a != null && a.length == iw * ih) {
               _aiFail = 0; // ★跑通了 → 连续失败计数清零
               if (kDiagLogOn) {
+                // ★成对：这一帧的输入 + 这一帧的原始输出，同一次请求
+                final pi = _dbgPendIn;
+                if (pi != null) {
+                  _dbgInRgb = pi;
+                  _dbgInW = _dbgPendW;
+                  _dbgInH = _dbgPendH;
+                }
                 _dbgRawA = Float32List.fromList(a); // 原始输出（整形前）
                 _dbgMakeImages();
               }
-              // ★帧间平滑（EMA）：新帧 65% + 上一帧 35%。AI 只有 8fps，
-              //   逐帧 alpha 抖动（边缘忽有忽无/闪烁）被明显压平；
-              //   代价是边缘响应稍慢一拍，与"跳帧插值"的滞后同量级。
+              // ★帧间平滑：权重按"运动量"自适应；静止时若面积突变则只吃 25%
+              //   （模型偶尔会跑偏整帧 —— 晃一下/遮挡一下就出现，直接采用就是
+              //    "原始输出偶尔不准"。这里用面积跳变 + 几乎没运动 判定为异常帧）
               final old = _prevAlpha;
               if (old != null && old.length == a.length) {
+                double sumNew = 0, sumOld = 0;
+                for (int i = 0; i < a.length; i += 7) {
+                  sumNew += a[i];
+                  sumOld += old[i];
+                }
+                final areaNew = sumNew / (a.length / 7);
+                final areaOld = sumOld / (a.length / 7);
+                double w = 0.65; // 常规
+                if (_motion > 0.10) {
+                  w = 0.85; // 动得快 → 跟手，减少拖影
+                } else if (_motion < 0.03) {
+                  w = 0.55; // 基本不动 → 更稳，不乱抖
+                  if (areaOld > 0.02 &&
+                      (areaNew > areaOld * 1.9 || areaNew < areaOld * 0.55)) {
+                    w = 0.25; // 静止却整块忽大忽小 = 这一帧跑偏，别当真
+                    DiagLog.instance.log('SEG',
+                        'alpha 异常帧被抑制（面积 $areaOld→$areaNew 运动$_motion）');
+                  }
+                }
+                _emaW = w;
                 for (int i = 0; i < a.length; i++) {
-                  a[i] = a[i] * 0.65 + old[i] * 0.35;
+                  a[i] = a[i] * w + old[i] * (1 - w);
                 }
               }
               _prevAlpha = a;
@@ -1150,17 +1199,26 @@ void _nv21ToRgbaScaled(
   var o = 0;
   for (int j = 0; j < dh; j++) {
     final sy = (j * yr).toInt();
-    final yRow = (sy < h ? sy : h - 1) * w;
-    final uvRow = frameSize + ((sy >> 1) < (h >> 1) ? (sy >> 1) : (h >> 1) - 1) * w;
+    final sy1 = sy + 1 < h ? sy + 1 : h - 1;
+    final yRow = sy * w, yRow1 = sy1 * w;
+    final uvRow = frameSize + (sy >> 1) * w;
+    final uvRow1 = frameSize + (sy1 >> 1) * w;
     for (int i = 0; i < dw; i++) {
       final sx = (i * xr).toInt();
-      final sxv = sx < w ? sx : w - 1;
-      var y = (nv21[yRow + sxv] & 0xff) - 16;
+      final sx1 = sx + 1 < w ? sx + 1 : w - 1;
+      // ★2×2 盒式平均：1.5 倍降采样直接用最近邻会出摩尔纹/锯齿，
+      //   模型输入一旦有锯齿，遮罩边缘就会随晃动忽好忽坏。
+      var y = ((nv21[yRow + sx] & 0xff) +
+              (nv21[yRow + sx1] & 0xff) +
+              (nv21[yRow1 + sx] & 0xff) +
+              (nv21[yRow1 + sx1] & 0xff)) ~/ 4 -
+          16;
       if (y < 0) y = 0;
-      // NV21：VU 交错，一对色度管 2 个像素 → 取偶数下标
-      final cu = uvRow + (sxv & ~1);
-      final v = (nv21[cu] & 0xff) - 128;
-      final u = (nv21[cu + 1] & 0xff) - 128;
+      // NV21：VU 交错，一对色度管 2 个像素 → 取偶数下标；色度按两行平均
+      final cu = uvRow + (sx & ~1);
+      final cu1 = uvRow1 + (sx & ~1);
+      final v = (((nv21[cu] & 0xff) + (nv21[cu1] & 0xff)) >> 1) - 128;
+      final u = (((nv21[cu + 1] & 0xff) + (nv21[cu1 + 1] & 0xff)) >> 1) - 128;
       final y1192 = 1192 * y;
       out[o] = _clamp((y1192 + 1634 * v) >> 10);
       out[o + 1] = _clamp((y1192 - 833 * v - 400 * u) >> 10);
@@ -1543,14 +1601,19 @@ Float32List shapeAlpha(Float32List alpha, int aw, int ah, double strength) {
     keep = _largestComponent(cleaned, hw, hh);
     // 兜底：如果清理后一个前景块都没剩下（模型这帧没识别人），
     // 不要把整帧抠成透明（那会只剩背景），直接放弃这层过滤。
-    var any = false;
+    var keepCnt = 0, binCnt = 0;
     for (int k = 0; k < keep.length; k++) {
-      if (keep[k] != 0) {
-        any = true;
-        break;
-      }
+      if (keep[k] != 0) keepCnt++;
+      if (bin[k] != 0) binCnt++;
     }
-    if (!any) keep = Uint8List(0);
+    // ★误裁保护：某些帧人会被切成两块（头/身分离）或被背景块抢走最大块，
+    //   只留最大的那块就会把身体裁掉 —— 表现就是偶尔不准。
+    //   保留下来的面积不到原始前景的一半，就判定这次清理不可信，整帧放弃过滤。
+    if (binCnt > 0 && keepCnt < binCnt * 0.5) {
+      DiagLog.instance.log('SEG',
+          'shapeAlpha 最大块只占 $keepCnt/$binCnt，放弃区域清理（保留原始 alpha）');
+      keep = Uint8List(0);
+    }
   }
   final useKeep = keep.isNotEmpty;
 
