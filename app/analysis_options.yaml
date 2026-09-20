@@ -9,6 +9,13 @@
 # packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  # tool/ 下是**本地自检脚本**（如运动估计的自检与数值打印），不是产品代码：
+  # 它们要 import lib/ 下的真实实现来跑，所以只能放在这个包里，
+  # 但它们不该被当成产品代码来 lint。
+  exclude:
+    - tool/**
+
 linter:
   # The lint rules applied to this project can be customized in the
   # section below to disable rules from the `package:flutter_lints/flutter.yaml`

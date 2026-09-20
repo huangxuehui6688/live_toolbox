@@ -11,9 +11,17 @@ import 'package:permission_handler/permission_handler.dart';
 import '../services/beauty_settings.dart';
 import '../services/diag_log.dart';
 import '../services/matting_engine.dart';
+import '../services/motion_flow.dart';
 
 /// AI 抠像连续失败多少次即熔断（停止重试 + 自动降级到实景）。
 const int kAiFailLimit = 8;
+
+/// ★运动补偿：用帧间块匹配（光流）把 AI 遮罩从"推理那一帧"外推到"当前帧"。
+///
+/// 为什么必须做：AI 只有 ~4fps，遮罩天生滞后约 0.25s。人一动，遮罩还停在旧姿态上，
+/// 于是人的**前缘会露出一条真实背景**（真机实测过：手往镜头前一伸，身上就露出房间）。
+/// 关掉它 = 退回"遮罩滞后"的原始行为（只用于 A/B 对比）。
+const bool kMotionComp = true;
 
 /// ★模型输入是否用"与画面同长宽比"的非方形尺寸（画面 100% 进模型）。
 ///
@@ -114,6 +122,16 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   Uint8List? _prevAiRgb; // 上一帧模型输入（算运动量用）
   double _motion = 0; // 帧间运动量（0~1，粗估：输入图相邻帧平均差）
   bool _dilateDbg = false; // 本次 alpha 是否做了"运动涨边"（HUD 上可核对）
+
+  // ---- ★运动补偿（光流/块匹配）----
+  Uint8List? _grayCur; // 当前帧灰度小图（模型输入空间 ÷2，如 96×176）
+  Uint8List? _grayReq; // 发推理请求那一帧的灰度小图（拷贝留底）
+  int _grayW = 0, _grayH = 0;
+  MotionField? _flow; // 最近一次估出的运动场
+  Float32List? _warpBuf; // alpha 外推的复用缓冲（避免每次分配）
+  final Float32List _flowTmp = Float32List(2);
+  int _flowMs = 0;
+  String _flowDbg = '';
   double _emaW = 0.65; // 本帧采用的平滑权重（排障可见）
   ui.Image? _frame;
   bool _busy = false;
@@ -584,6 +602,99 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     });
   }
 
+  /// 把模型输入 rgb（iw×ih，3 字节/像素）降采样成**一半大小的灰度图**，
+  /// 供帧间运动估计用。每帧只读一遍、无乘法、缓冲复用（约 0.3ms）。
+  /// 取 G 通道当亮度够用 —— 它只喂块匹配，不需要精确的 luma。
+  void _buildGray(Uint8List rgb, int iw, int ih) {
+    final gw = iw >> 1, gh = ih >> 1;
+    if (gw < 32 || gh < 32) return;
+    if (_grayW != gw || _grayH != gh || _grayCur == null) {
+      _grayW = gw;
+      _grayH = gh;
+      _grayCur = Uint8List(gw * gh);
+      _grayReq = null;
+      _flow = null;
+    }
+    final g = _grayCur!;
+    final rowStride = iw * 3;
+    var o = 0;
+    for (var y = 0; y < gh; y++) {
+      var a = (y << 1) * rowStride + 1; // 第一行第一列的 G
+      var b = a + rowStride; // 第二行第一列的 G
+      for (var x = 0; x < gw; x++) {
+        g[o++] = (rgb[a] + rgb[a + 3] + rgb[b] + rgb[b + 3]) >> 2;
+        a += 6;
+        b += 6;
+      }
+    }
+  }
+
+  /// 用「发请求那一帧」和「当前帧」的灰度小图估运动场。alpha 回来后、发布遮罩之前调。
+  void _estimateFlow(int iw) {
+    _flow = null;
+    _flowDbg = '关';
+    if (!kMotionComp) {
+      _maskDbg = '$_maskDbg  流=关';
+      return;
+    }
+    final pg = _grayReq, cg = _grayCur;
+    if (pg == null || cg == null || pg.length != cg.length || _grayW <= 0) {
+      _flowDbg = '无灰度';
+      _maskDbg = '$_maskDbg  流=无灰度';
+      return;
+    }
+    final sw = Stopwatch()..start();
+    final f = MotionEstimator.estimate(pg, cg, _grayW, _grayH, _grayW / iw);
+    sw.stop();
+    _flowMs = sw.elapsedMicroseconds ~/ 1000;
+    // ★安全网：整帧运动过大（场景切换 / 剧烈抖动 / 估计跑飞）就别补偿 ——
+    //   宁可回到"遮罩滞后"，也不能把遮罩推到乱七八糟的地方。
+    if (f != null && f.rmsModel() > 45) {
+      _flow = null;
+      _flowDbg = '流=过大${f.rmsModel().toStringAsFixed(0)}';
+      _maskDbg = '$_maskDbg  $_flowDbg ${_flowMs}ms';
+      return;
+    }
+    _flow = f;
+    _flowDbg = f == null
+        ? '流=无'
+        : '流均${f.rmsModel().toStringAsFixed(1)}/峰${f.maxModel().toStringAsFixed(0)}';
+    _maskDbg = '$_maskDbg  $_flowDbg ${_flowMs}ms';
+  }
+
+  /// 用运动场把 alpha 从「推理那一帧」外推到「当前帧」。
+  ///
+  /// 位移 v = 内容从旧帧到新帧的位移（见 MotionField 的说明），
+  /// 所以新帧 (x,y) 处的 alpha 要去旧帧的 (x-vx, y-vy) 采样（双线性）。
+  Float32List _warpAlpha(Float32List a, int aw, int ah, MotionField f) {
+    final out = (_warpBuf != null && _warpBuf!.length == aw * ah)
+        ? _warpBuf!
+        : (_warpBuf = Float32List(aw * ah));
+    final maxX = (aw - 1).toDouble(), maxY = (ah - 1).toDouble();
+    for (var y = 0; y < ah; y++) {
+      final yf = y.toDouble();
+      for (var x = 0; x < aw; x++) {
+        f.sampleModel(x.toDouble(), yf, _flowTmp);
+        var sx = x - _flowTmp[0];
+        var sy = y - _flowTmp[1];
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        if (sx > maxX) sx = maxX;
+        if (sy > maxY) sy = maxY;
+        final x0 = sx.floor(), y0 = sy.floor();
+        final x1 = x0 + 1 < aw ? x0 + 1 : x0;
+        final y1 = y0 + 1 < ah ? y0 + 1 : y0;
+        final tx = sx - x0, ty = sy - y0;
+        final o0 = y0 * aw + x0, o1 = y0 * aw + x1;
+        final o2 = y1 * aw + x0, o3 = y1 * aw + x1;
+        final r0 = a[o0] + (a[o1] - a[o0]) * tx;
+        final r1 = a[o2] + (a[o3] - a[o2]) * tx;
+        out[y * aw + x] = r0 + (r1 - r0) * ty;
+      }
+    }
+    return out;
+  }
+
   /// 遮罩矩阵：把遮罩图（与转正画面同长宽比）摆到屏幕上画面所在的那个矩形。
   ///
   /// 画面按 cover 比例 k 铺满控件，所以它的屏幕矩形是 `rw*k × rh*k` 居中（比控件大）。
@@ -877,6 +988,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         //   边缘都对不上。这里按路径取正确的那个约定。
         final rotDeg = kGpuComposite ? orientation : (360 - orientation) % 360;
         _sampleSquareRgb(rgba, fw, fh, rotDeg, iw, ih, rgb);
+        // ★运动补偿：顺手做一张一半大小的灰度图（每帧一遍、零分配）
+        if (kMotionComp) _buildGray(rgb, iw, ih);
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
         // ★运动量：与上一帧输入图逐点比较（跳点采样，开销可忽略）
         final prevRgb = _prevAiRgb;
@@ -911,6 +1024,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           _aiReqPending = true;
           // rgb 是复用缓冲，请求在途时会被下一帧覆盖 → 拷一份交给后台
           final payload = Uint8List.fromList(rgb);
+          // ★留一份"这一帧"的灰度：等 alpha 回来时和"当前帧"比对，估出运动场
+          if (kMotionComp && _grayCur != null) {
+            _grayReq = Uint8List.fromList(_grayCur!);
+          }
           final myGen = gen;
           eng.matting(payload, iw, ih).then((a) {
             _aiReqPending = false;
@@ -964,8 +1081,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               //   ★必须先用 shapeAlpha 整形（区域清理 + 羽化 + 强度映射），
               //     否则边缘是一圈锯齿 —— 老 CPU 路径的清晰度就来自这一步。
               if (kGpuComposite) {
-                _publishAlpha(
-                    shapeAlpha(a, iw, ih, widget.strength), iw, ih);
+                // ★先整形（区域清理 + 羽化），再按运动场外推到当前帧。
+                //   顺序不能反：区域清理要在"可信的原始 alpha"上做。
+                var alpha = shapeAlpha(a, iw, ih, widget.strength);
+                _estimateFlow(iw);
+                final fl = _flow;
+                if (fl != null) alpha = _warpAlpha(alpha, iw, ih, fl);
+                _publishAlpha(alpha, iw, ih);
               }
             } else if (eng.errorStreak > 0) {
               // 引擎「忙」不是错误；只有真的连续报错才计数 → 到阈值熔断
