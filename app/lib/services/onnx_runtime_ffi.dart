@@ -344,6 +344,10 @@ class OrtSession {
   String activeProvider = 'CPUExecutionProvider';
   String lastError = '';
 
+  /// ★open() 失败的原因。失败时实例会被丢弃，只能靠静态字段把错误带出来
+  /// （容器里没有 logcat，端侧排障全靠这一个字符串）。
+  static String lastOpenError = '';
+
   /// 输入缓冲：native 内存 + Dart 侧视图，跨帧复用。
   late final Float32List inputF32;
   late final Uint8List inputU8;
@@ -379,8 +383,12 @@ class OrtSession {
       int? preferW,
       int? preferH,
       String preferProvider = 'XNNPACK'}) {
+    lastOpenError = '';
     final base = _openApiBase();
-    if (base == nullptr) return null;
+    if (base == nullptr) {
+      lastOpenError = 'libonnxruntime 未加载（so 找不到）';
+      return null;
+    }
     final getApi = Pointer<NativeFunction<_NGetApi>>.fromAddress(
             base.cast<Pointer<Void>>()[_iApiBaseGetApi].address)
         .asFunction<_DGetApi>();
@@ -422,6 +430,7 @@ class OrtSession {
       final code = _dInt32(api, _iGetErrorCode)(st);
       final msg = _readCStr(_dStr(api, _iGetErrorMessage)(st));
       _dVoidA(api, _iReleaseStatus)(st);
+      lastOpenError = '[$code] $msg'; // ★失败原因带出去
       return '[$code] $msg';
     }
 
@@ -562,10 +571,16 @@ class OrtSession {
       }
       ortFree(dcP);
 
-      if (dims.length != 4) return null;
+      if (dims.length != 4) {
+        lastOpenError = '模型输入不是 4 维（odc=$dims）';
+        return null;
+      }
       final h = dims[2] > 0 ? dims[2] : (preferH ?? preferSize);
       final w = dims[3] > 0 ? dims[3] : (preferW ?? preferSize);
-      if (h <= 0 || w <= 0) return null; // ★不再要求 h == w
+      if (h <= 0 || w <= 0) {
+        lastOpenError = '输入尺寸解析失败 h=$h w=$w';
+        return null;
+      } // ★不再要求 h == w
       self.inputH = h;
       self.inputW = w;
 
@@ -644,7 +659,10 @@ class OrtSession {
           memInfo, self._inData, inLen, inShape, 4, self.inputElementType,
           _pp(inValOut)));
       ortFree(inShape);
-      if (e6.isNotEmpty) return null;
+      if (e6.isNotEmpty) {
+        lastOpenError = '建输入张量失败: $e6';
+        return null;
+      }
       self._inValue = _pp(inValOut).value;
 
       // ---- 输出张量（native 缓冲，一次建好） ----
@@ -662,7 +680,10 @@ class OrtSession {
           memInfo, self._outData, outLen, outShape, 4, self.outputElementType,
           _pp(outValOut)));
       ortFree(outShape);
-      if (e7.isNotEmpty) return null;
+      if (e7.isNotEmpty) {
+        lastOpenError = '建输出张量失败: $e7';
+        return null;
+      }
       self._outValue = _pp(outValOut).value;
 
       // ---- Run 用到的数组 ----
@@ -689,7 +710,8 @@ class OrtSession {
       self._ok = true;
       handedOver = true;
       return self;
-    } catch (_) {
+    } catch (e) {
+      lastOpenError = '异常: $e';
       return null;
     } finally {
       ortFree(tmpCStr);

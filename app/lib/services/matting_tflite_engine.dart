@@ -31,6 +31,10 @@ class TfliteGpuEngine implements MattingEngine {
   @override
   String diag = '';
 
+  /// ★最近一次失败原因（该引擎目前未被使用，仅为满足接口）
+  @override
+  String lastError = '';
+
   /// 上次加载失败的原因（HUD 显示用，排查容器兼容性）
   String lastFailReason = '';
 

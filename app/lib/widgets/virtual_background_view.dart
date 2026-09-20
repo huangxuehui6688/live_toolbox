@@ -27,6 +27,20 @@ const bool kFullFrameInput = true;
 /// 画面却 100% 进模型 —— 这是覆盖率和帧率之间比较划算的一档。
 const int kAiInputWidth = 192;
 
+/// ★把模型输入尺寸对齐到 32 的倍数。
+///
+/// 为什么必须对齐：MODNet 内部有 5 次 stride-2 下采样（总 /32）。某个维度不是
+/// 32 的倍数时，不同分支对 "除以 2" 的取整方向不一致，会在 Concat 处差 1：
+///   真机实测 192x341（341 为奇数）→
+///   "Axis 2 has mismatched dimensions of 171 and 170" → **整帧推理失败**。
+/// 取最接近的 32 倍数即可，长宽比只差百分之几；取样与遮罩映射共用同一套
+/// 仿射参数（sampleAffine 按轴独立算比例），所以几何仍然精确对齐。
+int _align32(int v) {
+  final a = ((v + 16) ~/ 32) * 32;
+  if (a < 32) return 32;
+  return a > 1024 ? 1024 : a;
+}
+
 /// 运行期生效的"整幅缩放"开关 = [kFullFrameInput] 且**引擎回报的输入确实非方形**。
 /// 若 ONNX 把输入写死成方形（动态轴没生效），就必须退回居中裁方 ——
 /// 否则把 9:16 的画面硬塞进方形等于把人压扁，抠像必定崩。
@@ -95,6 +109,26 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   int _camGen = 0; // 摄像头"代号"：每次重建 +1，用于丢弃旧摄像头残留的帧
   bool _frameMirror = true; // ★当前 _frame 对应的"是否镜像"，与帧绑定（切摄像头时不串位）
   String _maskDbg = '';
+
+  /// ★端侧排障面板文本。容器里没有 logcat、HTTP 信标也打不出去
+  /// （容器网络 NAT 隔离，ping 通但 TCP 不通），所以"错误上屏 + 截图"
+  /// 是唯一能把真实现场带回电脑的通道。排障期显示，发版靠 kDiagLogOn 关掉。
+  String _dbgPanel = '';
+
+  void _dbg(String what) {
+    if (!kDiagLogOn) return;
+    final e = _engine;
+    final buf = <String>[
+      '$what',
+      '引擎=${e == null ? "null" : "ok"} in=${e?.inputW}x${e?.inputH} '
+          '提供器=${e?.diag ?? "-"}',
+      'fail=$_aiFail/$kAiFailLimit 加载失败=$_loadFails 在途=$_aiReqPending '
+          '成功帧=$_aiFrames 整幅=$gFullFrameInput aiIn=$_aiInW x$_aiInH',
+    ];
+    final er = e?.lastError ?? '';
+    if (er.isNotEmpty) buf.add('ERR: $er');
+    if (mounted) setState(() => _dbgPanel = buf.join('\n'));
+  }
   bool _loadingEngine = false; // ★引擎加载互斥锁：加载耗时期间每帧都会进 _loadEngine，防并发 spawn 多个引擎
   /// 诊断：掩膜尺寸/背景占比/均值（排查"抠像没生效"用）
   DateTime? _busySince; // 进入 _busy 的时刻（看门狗用）
@@ -107,7 +141,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
 
   /// 模型输入尺寸（_init 里按画面长宽比定；默认按 9:16 给）
   int _aiInW = kAiInputWidth;
-  int _aiInH = 342;
+  int _aiInH = 352; // 与 _align32 对齐（192x352，长宽比 9:16.5）
 
   ui.Image? _alphaImg; // alpha 小图（RGBA 白底，只取 alpha 通道当遮罩）
   bool _alphaImgBusy = false; // 上一张还没建好就跳过（alpha 本身只有 2~4fps）
@@ -242,8 +276,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         final uw = swapO ? ps.height : ps.width;
         final uh = swapO ? ps.width : ps.height;
         if (uw > 0 && uh > 0) {
-          _aiInW = kAiInputWidth;
-          _aiInH = (_aiInW * uh / uw).round().clamp(64, 1024);
+          // ★两个维度都对齐到 32 的倍数，否则模型内部 Concat 会因 171/170
+          //   这种"差 1"直接报错（真机实测，见 _align32 的说明）
+          _aiInW = _align32(kAiInputWidth);
+          _aiInH = _align32((_aiInW * uh / uw).round());
         }
       } else {
         _aiInW = 256;
@@ -332,6 +368,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 连续 2 次加载失败直接熔断，不让用户在"AI 正在加载"里干等好几分钟。
   void _noteLoadFailure(String why) {
     _loadFails++;
+    _dbg('加载失败: $why');
     DiagLog.instance.log('SEG', '引擎加载失败 $_loadFails 次: $why');
     _aiFail++;
     if (_loadFails >= 2 || _aiFail >= kAiFailLimit) _tripBreaker();
@@ -340,6 +377,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 记一次 AI 抠像失败；连续失败到阈值就熔断并降级。
   void _noteAiFailure() {
     _aiFail++;
+    _dbg('推理失败 $_aiFail/$kAiFailLimit');
     debugPrint('[SEG] AI 抠像失败 $_aiFail/$kAiFailLimit');
     if (_aiFail >= kAiFailLimit) _tripBreaker();
   }
@@ -788,7 +826,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       }
       old?.dispose();
     } catch (e) {
-      // 技术细节只进日志；界面不显示英文异常
+      // 技术细节只进日志；界面不显示英文异常（排障面板除外）
+      _dbg('单帧异常: $e');
       debugPrint('[SEG] 单帧处理失败($_aiFail/$kAiFailLimit): $e');
       // ★连续失败到阈值 → 熔断并降级到实景：既止血画质，也掐掉每帧抛异常的发热源
       _noteAiFailure();
@@ -825,6 +864,25 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           ),
         ),
       ),
+      // ★端侧排障面板（底部）：把引擎真实错误显示在画面上，供截图回传
+      if (kDiagLogOn && _dbgPanel.isNotEmpty)
+        Positioned(
+          left: 6,
+          right: 6,
+          bottom: MediaQuery.paddingOf(context).bottom + 6,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: .74),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(
+              _dbgPanel,
+              style: const TextStyle(
+                  color: Colors.white, fontSize: 12, height: 1.35),
+            ),
+          ),
+        ),
       // ★AI 抠像实时状态角标：只在 AI 抠像开启时显示，右上角不抢画面。
       // 每秒随现有 setState 结算一次 _aiFps（不额外 setState），供老板看"现在几帧"。
       if (_useAi && _engine != null)

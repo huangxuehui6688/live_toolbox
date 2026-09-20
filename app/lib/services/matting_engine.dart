@@ -47,6 +47,10 @@ abstract class MattingEngine {
 
   /// 诊断串（执行提供器 / ORT 版本 / 输入尺寸），只给 HUD 和日志用
   String get diag;
+
+  /// ★最近一次失败的原因（原始文本，排障用；正常时为空串）。
+  /// 容器里没有 logcat，这个字符串会被直接显示在画面上。
+  String get lastError;
 }
 
 /// 基于 ONNX Runtime + MODNet 的实现。
@@ -91,12 +95,16 @@ class ModnetMattingEngine implements MattingEngine {
   int _inputH = 512;
   int _inputW = 512;
   int _errStreak = 0;
+  String _lastError = '';
 
   @override
   String diag = '';
 
   @override
   int get errorStreak => _errStreak;
+
+  @override
+  String get lastError => _lastError;
 
   @override
   int get inputH => _inputH;
@@ -137,7 +145,10 @@ class ModnetMattingEngine implements MattingEngine {
         final path = await _ensureModelFile(entry.key);
         DiagLog.instance.log('MATTING',
             '尝试 ${entry.key}（provider=${entry.value}）→ ${path ?? "模型落盘失败"}');
-        if (path == null) continue;
+        if (path == null) {
+          _lastError = '模型资产落盘失败: ${entry.key}';
+          continue;
+        }
         final r = await _send(<String, Object?>{
           'cmd': 'load',
           'id': _seq++,
@@ -149,11 +160,13 @@ class ModnetMattingEngine implements MattingEngine {
           'provider': entry.value,
         }, const Duration(seconds: 90));
         if (r == null) {
-          DiagLog.instance.log('MATTING', 'load 超时/无响应（90s）');
+          _lastError = 'load 超时/无响应（90s）';
+          DiagLog.instance.log('MATTING', _lastError);
           continue;
         }
         if (r['ok'] != true) {
-          DiagLog.instance.log('MATTING', 'load 失败: ${r['err'] ?? "worker 返回 ok=false"}');
+          _lastError = 'load 失败: ${r['err'] ?? "worker 返回 ok=false"}';
+          DiagLog.instance.log('MATTING', _lastError);
           continue;
         }
         final active = (r['provider'] as String?) ?? '';
@@ -173,11 +186,15 @@ class ModnetMattingEngine implements MattingEngine {
         DiagLog.instance.log('MATTING', 'MODNet 就绪：$diag');
         return true;
       }
-      DiagLog.instance.log('MATTING', '所有尝试都失败（NNAPI/int8 与 XNNPACK/fp32 均不可用）');
+      if (_lastError.isEmpty) {
+        _lastError = '所有尝试都失败（NNAPI/int8 与 XNNPACK/fp32 均不可用）';
+      }
+      DiagLog.instance.log('MATTING', _lastError);
       diag = '';
       return false;
     } catch (e) {
-      DiagLog.instance.log('MATTING', '加载链路异常: $e');
+      _lastError = '加载链路异常: $e';
+      DiagLog.instance.log('MATTING', _lastError);
       diag = '';
       return false;
     }
@@ -186,11 +203,13 @@ class ModnetMattingEngine implements MattingEngine {
   @override
   Future<Float32List?> matting(Uint8List rgb, int w, int h) async {
     if (!_ready || _cmd == null) {
+      _lastError = '引擎未就绪（ready=$_ready）';
       _errStreak++;
       return null;
     }
     if (_busy) return null; // ★跳帧：推理还在跑，本帧沿用上一帧 alpha（不算错误）
     if (w <= 0 || h <= 0 || rgb.length < w * h * 3) {
+      _lastError = '入参异常 w=$w h=$h rgb=${rgb.length}';
       _errStreak++;
       return null;
     }
@@ -205,13 +224,19 @@ class ModnetMattingEngine implements MattingEngine {
       }, const Duration(seconds: 5));
       final a = r?['alpha'];
       if (a is! Float32List) {
+        // ★把 worker 的真实错误（ORT 报错 / 异常文本）带出来
+        _lastError = r == null
+            ? '推理请求超时/无响应（5s，引擎忙或已卡死）'
+            : '${r['err'] ?? "worker 未返回 alpha"} '
+                '（in=${r['in'] ?? '?'} 出元素=${r['outN'] ?? '?'}）';
         _errStreak++;
         return null;
       }
       _errStreak = 0;
+      _lastError = '';
       return a;
     } catch (e) {
-      debugPrint('[MATTING] 推理取回失败: $e');
+      _lastError = '推理取回失败: $e';
       _errStreak++;
       return null;
     } finally {
@@ -316,7 +341,9 @@ Future<void> _modnetWorker(SendPort replyPort) async {
           replyPort.send(<String, Object?>{
             'id': id,
             'ok': false,
-            'err': 'OrtSession.open 返回 null',
+            'err': OrtSession.lastOpenError.isEmpty
+                ? 'OrtSession.open 返回 null'
+                : OrtSession.lastOpenError,
           });
         } else {
           final providers = OrtSession.availableProviders();
@@ -341,7 +368,13 @@ Future<void> _modnetWorker(SendPort replyPort) async {
         }
         _fillInput(s, msg['rgb'] as Uint8List, msg['w'] as int, msg['h'] as int);
         final alpha = s.run();
-        replyPort.send(<String, Object?>{'id': id, 'alpha': alpha});
+        replyPort.send(<String, Object?>{
+          'id': id,
+          'alpha': alpha,
+          'err': alpha == null ? s.lastError : null,
+          'in': '${s.inputW}x${s.inputH}',
+          'outN': s.outputElementCount,
+        });
       } else if (cmd == 'dispose') {
         sess?.dispose();
         sess = null;
