@@ -30,10 +30,14 @@ const int kAiInputWidth = 192;
 /// ★诊断开关：把"模型看到的画面"按**遮罩同一套映射**半透明叠到实时预览上。
 /// 用来直接测量"预览纹理的真实映射"与"代码假设映射"的偏差（偏移/缩放/镜像）。
 /// 只在排障期开，配 kDiagLogOn 一起关。
-const bool kDiagOverlayInput = true;
+const bool kDiagOverlayInput = false;
 
 /// 叠加时同时画"镜像后"的那一套（绿色），用于一眼判断该用哪套映射。
 const bool kDiagOverlayBoth = true;
+
+/// 遮罩小图的长边像素。256 → 384：边界更细。
+/// （模型本身只有 192×352，再加没有新信息，只让放大更平滑、台阶更小）
+const int kMaskLong = 384;
 
 /// ★出画帧的宽度（采集帧会缩放到这个宽度）。1280（≈720p）是画质与耗时的平衡点：
 /// 显示与模型都吃这一张，几何按构造一致，不再依赖"相机预览纹理"的任何假设。
@@ -109,6 +113,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   bool _aiReqPending = false;
   Uint8List? _prevAiRgb; // 上一帧模型输入（算运动量用）
   double _motion = 0; // 帧间运动量（0~1，粗估：输入图相邻帧平均差）
+  bool _dilateDbg = false; // 本次 alpha 是否做了"运动涨边"（HUD 上可核对）
   double _emaW = 0.65; // 本帧采用的平滑权重（排障可见）
   ui.Image? _frame;
   bool _busy = false;
@@ -494,8 +499,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     final uw = (swap ? f.height : f.width).round();
     final uh = (swap ? f.width : f.height).round();
     if (uw <= 0 || uh <= 0) return;
-    final mw = uw >= uh ? 256 : math.max(8, (256 * uw / uh).round());
-    final mh = uh >= uw ? 256 : math.max(8, (256 * uh / uw).round());
+    final mw = uw >= uh ? kMaskLong : math.max(8, (kMaskLong * uw / uh).round());
+    final mh = uh >= uw ? kMaskLong : math.max(8, (kMaskLong * uh / uw).round());
     final af = sampleAffine(uw, uh, aw, ah);
     final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
     if (kDiagLogOn) {
@@ -535,11 +540,35 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         px[o++] = v;
       }
     }
+    // ★快速移动时把 alpha 胀一圈（4 邻域取最大，半径 1 个遮罩像素 ≈ 5 物理像素）。
+    //   模型只有 3fps，人一动遮罩就滞后 → 人的**前缘**会露出一条背景（"背景漏出来"）。
+    //   宁可轮廓胖一点点，也不让背景从人身上漏出来；静止时不做，边缘保持贴合。
+    _dilateDbg = _motion > 0.12;
+    if (_dilateDbg) {
+      final src = Uint8List.fromList(px);
+      for (int my = 1; my < mh - 1; my++) {
+        final row = my * mw;
+        for (int mx = 1; mx < mw - 1; mx++) {
+          final o = (row + mx) * 4;
+          final c = src[o];
+          var v = c;
+          final l = src[o - 4], r = src[o + 4];
+          final u = src[o - mw * 4], d = src[o + mw * 4];
+          if (l > v) v = l;
+          if (r > v) v = r;
+          if (u > v) v = u;
+          if (d > v) v = d;
+          if (v != c) {
+            px[o] = v;
+            px[o + 1] = v;
+            px[o + 2] = v;
+            px[o + 3] = v;
+          }
+        }
+      }
+    }
+
     final seq = ++_alphaSeq;
-    // ★放大到 1024² 再给 GPU：ShaderMask 的 ImageShader 默认 FilterQuality.none
-    //   （最近邻），256² 直接铺到 ~1600 物理像素的方块上会看到 ~5px 的方块台阶；
-    //   让 decode 时插值放大到 1024²，台阶降到 ~1.5px，肉眼基本看不出。
-    //   （自己不用写放大循环，交给 C++ 侧的解码器）
     ui.decodeImageFromPixels(px, mw, mh, ui.PixelFormat.rgba8888, (img) {
       _alphaImgBusy = false;
       if (!mounted || seq != _alphaSeq) {
@@ -552,7 +581,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (oldA != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) => oldA.dispose());
       }
-    }, targetWidth: mw * 4, targetHeight: mh * 4);
+    });
   }
 
   /// 遮罩矩阵：把遮罩图（与转正画面同长宽比）摆到屏幕上画面所在的那个矩形。
@@ -679,6 +708,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
             _maskMatrix(bounds.width, bounds.height, rotDeg, mirror,
                     alpha.width, alpha.height)
                 .storage,
+            // ★双线性插值：ImageShader 默认是最近邻，遮罩铺到 ~1600 物理像素会看到
+            //   方块台阶。用 medium 让边缘平滑，也就不必再把遮罩放大 4 倍
+            //   （省掉每帧 ~2.4MB 的解码与显存）
+            filterQuality: FilterQuality.medium,
           ),
           child: person,
         ),
@@ -777,7 +810,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     _maskDbg = '${prov.isEmpty ? '' : '$prov  '}'
         'AI ${aw}x$ah 背景${(bg * 100 / n).round()}% '
         '均值${(sum / n).toStringAsFixed(2)} '
-        '最低${mn.toStringAsFixed(2)} 最高${mx.toStringAsFixed(2)}';
+        '最低${mn.toStringAsFixed(2)} 最高${mx.toStringAsFixed(2)}'
+        '${_dilateDbg ? ' 涨边+1' : ''}';
   }
 
   Future<void> _onFrame(
