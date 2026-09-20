@@ -393,7 +393,8 @@ class OrtSession {
       int preferSize = 512,
       int? preferW,
       int? preferH,
-      String preferProvider = 'XNNPACK'}) {
+      String preferProvider = 'XNNPACK',
+      bool parMode = false}) {
     lastOpenError = '';
     final base = _openApiBase();
     if (base == nullptr) {
@@ -436,10 +437,14 @@ class OrtSession {
       return p;
     }
 
-    /// 静默释放一个 Status（用于"可以失败"的调用，比如钉动态轴时名字对不上）。
-    /// ★不能走 takeErr：那会把 lastOpenError 写成"失败"，误导上层重试。
-    void dropErr(Pointer<Void> st) {
-      if (st != nullptr) _dVoidA(api, _iReleaseStatus)(st);
+    /// 只取错误文本（释放 Status），**不写 lastOpenError** —— 用于"可以失败"
+    /// 的调用，但我们需要知道原因（诊断用）。
+    String errText(Pointer<Void> st) {
+      if (st == nullptr) return '';
+      final code = _dInt32(api, _iGetErrorCode)(st);
+      final msg = _readCStr(_dStr(api, _iGetErrorMessage)(st), max: 400);
+      _dVoidA(api, _iReleaseStatus)(st);
+      return '[$code] $msg';
     }
 
     String takeErr(Pointer<Void> st) {
@@ -475,13 +480,56 @@ class OrtSession {
       _dStatusAI(api, _iSetInterOpNumThreads)(opts, 1);
       _dStatusAI(
           api, _iSetSessionGraphOptimizationLevel)(opts, _ortEnableAll);
-      _dStatusAI(api, _iSetSessionExecutionMode)(opts, 0);
+      // ★执行模式：0=顺序(ORT_SEQUENTIAL) / 1=并行(ORT_PARALLEL)。
+      //   MODNet 的图里有多条可并行的分支，并行模式有时能吃到好处 ——
+      //   但也可能因线程竞争更慢，所以由上层**实测**决定（parMode）。
+      _dStatusAI(api, _iSetSessionExecutionMode)(opts, parMode ? 1 : 0);
       _dStatusA(api, _iEnableCpuMemArena)(opts);
       _dStatusA(api, _iEnableMemPattern)(opts);
 
       // 按 preferProvider 挂执行提供器：'NNAPI'（NPU/GPU 加速）、'XNNPACK'（ARM
       // 向量优化）、'CPU'（不挂任何 EP，走 ORT 默认 CPU）。
       // ★挂不上时**直接返回 null**（由上层换组合），不再静默回落 CPU —— 详见下面。
+      // ★★★ 顺序很重要：**先钉动态轴，再挂执行提供器**。
+      //   ① 轴没钉住的组合，挂上了也没意义（硬件 EP 分区不了"形状未知"的算子）；
+      //   ② 上一版把它放在挂载之后 —— 而挂载一失败就提前 return，导致 HUD 上
+      //      `钉轴[]` 永远是"无"，把"轴名写错"这条线索自己藏起来了。
+      // ---- ★把动态轴钉死（NNAPI 生效的**必要条件**）----
+      // 硬件 EP 无法为"形状未知"的算子分配资源：模型输入是 [batch,3,height,width]
+      // 符号轴时，它们会整段退回 CPU（挂了等于没挂），有的直接拒绝。
+      // 模型里轴的 dim_param 名实测为 batch / height / width。
+      // 名字对不上时 ORT 只会返回错误 Status，静默丢掉即可（dropErr）。
+      lastPinLog = '';
+      lastPinErr = '';
+      if (preferW != null && preferW > 0 && preferH != null && preferH > 0) {
+        // ★轴名必须是模型里**真实的 dim_param**。上一版把 batch 写成了 'batch'
+        //   （这个名字根本不存在）→ batch_size 仍是动态轴 → **NNAPI 照样拒绝分区**。
+        //   实测（直接解析 assets/models/modnet.onnx）：
+        //     input  [ 'batch_size', 3, 'height', 'width' ]
+        //     output [ 'batch_size', 1, 'height', 'width' ]
+        // 钉成功的项记进 lastPinLog 上 HUD —— 空串就说明一个都没钉上。
+        final pins = <String>[];
+        for (final d in <List<Object>>[
+          <Object>['batch_size', 1],
+          <Object>['height', preferH],
+          <Object>['width', preferW],
+          <Object>['batch', 1], // 兼容别处导出的写法（不存在时 ORT 只回错误 Status）
+        ]) {
+          tmpCStr = ortCStr(d[0] as String);
+          final st = _dStatusAI64(api, _iAddFreeDimensionOverrideByName)(
+              opts, tmpCStr, d[1] as int);
+          ortFree(tmpCStr);
+          tmpCStr = nullptr;
+          if (st == nullptr) {
+            pins.add('${d[0]}=${d[1]}');
+          } else {
+            // ★不再静默丢掉：把 ORT 的原始报错留下（上一次就是被吞了才白猜）
+            lastPinErr = '${d[0]}: ${errText(st)}';
+          }
+        }
+        lastPinLog = pins.join(',');
+      }
+
       var provider = 'CPUExecutionProvider';
       // ---- ★运行时枚举执行提供器（决定性诊断 + 修复挂载）----
       // 以前直接把 'NNAPI' / 'XNNPACK' 交给 AppendExecutionProvider，**一直失败**
@@ -510,36 +558,21 @@ class OrtSession {
           tmpCStr = nullptr;
           if (st == nullptr) {
             provider = name;
+            lastEpErr = '';
             break;
           }
-          dropErr(st); // 这个写法不被接受 → 换下一个
+          // ★留最后一条真实报错：它才说明"为什么挂不上"
+          //   （库在不在、名字对不对、EP 自己的 preload 失败……都在这句里）
+          lastEpErr = '$name: ${errText(st)}';
         }
         if (provider == 'CPUExecutionProvider') {
           // ★挂不上就**立刻判本次组合失败，不建 session**：
           //   照旧建下去只会拿到一个纯 CPU 的 session，白白加载一次 25MB 模型、
           //   还让上层误以为"这组可用"。
-          lastOpenError = '执行提供器 $preferProvider 挂不上（本机可用: '
-              '${avail.isEmpty ? "枚举失败" : avail.join("/")}）';
+          lastOpenError = '执行提供器 $preferProvider 挂不上'
+              '${lastEpErr.isEmpty ? '' : ' → $lastEpErr'}'
+              '（本机可用: ${avail.isEmpty ? "枚举失败" : avail.join("/")}）';
           return null;
-        }
-      }
-
-      // ---- ★把动态轴钉死（NNAPI 生效的**必要条件**）----
-      // 硬件 EP 无法为"形状未知"的算子分配资源：模型输入是 [batch,3,height,width]
-      // 符号轴时，它们会整段退回 CPU（挂了等于没挂），有的直接拒绝。
-      // 模型里轴的 dim_param 名实测为 batch / height / width。
-      // 名字对不上时 ORT 只会返回错误 Status，静默丢掉即可（dropErr）。
-      if (preferW != null && preferW > 0 && preferH != null && preferH > 0) {
-        for (final d in <List<Object>>[
-          <Object>['batch', 1],
-          <Object>['height', preferH],
-          <Object>['width', preferW],
-        ]) {
-          tmpCStr = ortCStr(d[0] as String);
-          dropErr(_dStatusAI64(api, _iAddFreeDimensionOverrideByName)(
-              opts, tmpCStr, d[1] as int));
-          ortFree(tmpCStr);
-          tmpCStr = nullptr;
         }
       }
 
@@ -875,6 +908,16 @@ class OrtSession {
   /// ★有的机器其实支持 NPU，只是我们以前把名字挂错了 —— 这份列表就是判据。
   static List<String> lastProviders = <String>[];
 
+  /// 最近一次 open() 里"钉动态轴"实际成功的那些（诊断用，直接上 HUD）。
+  /// 空串 = 一个都没钉上（那 NNAPI 必然挂不上）。
+  static String lastPinLog = '';
+
+  /// 钉轴失败时的**原始 ORT 报错**（上一版把它吞了，害我白猜一轮）。
+  static String lastPinErr = '';
+
+  /// 挂执行提供器失败时的**原始 ORT 报错**。
+  static String lastEpErr = '';
+
   /// 运行时枚举已注册的执行提供器（open() 内部用；失败返回空表，不抛）。
   static List<String> _listProviders(Pointer<Pointer<Void>> api) {
     final out = <String>[];
@@ -898,6 +941,32 @@ class OrtSession {
       ortFree(lenP);
     } catch (_) {}
     return out;
+  }
+
+  /// ★诊断：**从 App 进程内**（= 卓易通容器里）到底能 dlopen 到哪些底层库。
+  ///
+  /// 为什么必须在这里测：hdc shell 看到的是**鸿蒙侧**的 /system，不是容器的
+  /// Android 用户态 —— 在鸿蒙侧找不到 libneuralnetworks.so 并不能说明容器里没有。
+  /// 库里有什么，才决定"GPU / NNAPI / 厂商 NPU"这条路到底存不存在。
+  static String probeRuntimeLibs() {
+    const cands = <String>[
+      'libneuralnetworks.so', // Android NNAPI（NPU/GPU 的官方入口）
+      'libEGL.so', // 容器有没有 GPU 上下文
+      'libGLESv3.so',
+      'libvulkan.so',
+      'libOpenCL.so',
+      'libnnrt.so', // 华为 NN Runtime（CANN/达芬奇）
+      'libhiai.so', // 华为 HiAI
+      'libmindspore_lite.so',
+    ];
+    final ok = <String>[];
+    for (final n in cands) {
+      try {
+        DynamicLibrary.open(n);
+        ok.add(n.substring(3, n.length - 3)); // 去掉 lib/.so
+      } catch (_) {}
+    }
+    return ok.join(',');
   }
 
   /// 诊断：本机 ORT 实际注册了哪些执行提供器。只应在加载/排障时调一次。

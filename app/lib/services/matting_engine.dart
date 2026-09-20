@@ -11,11 +11,51 @@ import 'diag_log.dart';
 import 'onnx_runtime_ffi.dart';
 
 /// 挂上硬件加速后，允许的最长单次**纯推理**耗时（ms）。超过就往下退一档尺寸。
-/// 320ms ≈ 3fps 的遮罩刷新率，是「人动起来还能靠运动补偿顶住」的下限。
-const int kAiBudgetMs = 320;
+/// ★口径不能只看推理：一整轮的周期还包含后处理与等下一帧（约 130ms），
+///   所以预算是按「**周期 ≤ ~320ms（≥3fps）**」倒推的 → 推理 ≤ 180ms。
+///   老板的头号痛点就是「一动遮罩就延迟跟着」，所以宁可尺寸小一点，也不把延迟做大。
+const int kAiBudgetMs = 180;
 
 /// 自适应输入尺寸候选（宽×高，都是 32 的倍数、长宽比≈9:16）——**从大到小**试，
 /// 取第一个「跑得进预算」的：越大，遮罩边缘越细（放大到 1300+ 物理像素越不糊）。
+/// CPU 配置实测扫描的总时间预算（ms）。超了就提前收工 ——
+/// 宁可少试两组，也不能把"AI 出不来"拖太久。
+const int kSweepBudgetMs = 20000;
+
+/// ★配置实测扫描的开关。**默认关**。
+///
+/// 为什么关掉：这台机器上 UI 线程与推理**抢同一份 CPU**，
+/// 而 `bench` 是在"没人抢"的启动期测的 —— 同一个基线配置，
+/// bench 说 98ms、真实运行却 449ms（差 4.6 倍）。用它比较配置会**选错**，
+/// 上一版就是这样把 session 留在"并行模式"上、整版变慢的。
+/// 要重启这个实验，必须先让 bench 在有负载时也准（或改成用真实运行耗时比较）。
+const bool kCfgSweep = false;
+
+/// 启动期要在真机上实测的一组配置（模型 × 执行模式 × 线程数）。
+///
+/// 为什么必须实测：这些量在桌面和手机上**结论相反** ——
+///   · int8 在 x86 上比 fp32 慢近一倍，但 ARM64 的 ORT 有专门的 int8 GEMM
+///     （sdot/udot），很可能反过来快一大截；
+///   · 移动 SoC 是 big.LITTLE，"线程开满"会被摊到小核上互抢，常常更慢；
+///   · 并行执行模式对多分支的图有用，但也可能因竞争变慢。
+/// 所以不猜，逐个重开 session + 真实推理计时。（每次约 2~4s，条目刻意少。）
+class CpuCfg {
+  const CpuCfg(this.label, this.model, this.par, this.threads, this.gain);
+  final String label;
+  final String model;
+  final bool par;
+  final int threads;
+
+  /// 必须比当前最优**再快**这个比例才采纳（<1）。int8 有画质风险，门槛更高。
+  final double gain;
+}
+
+const List<CpuCfg> kCpuCfgs = <CpuCfg>[
+  CpuCfg('int8顺序', kModnetInt8AssetPath, false, 5, 0.72),
+  CpuCfg('fp32顺序3线程', kModnetAssetPath, false, 3, 0.90),
+  CpuCfg('fp32并行5线程', kModnetAssetPath, true, 5, 0.90),
+];
+
 const List<List<int>> kAutoMattingSizes = <List<int>>[
   <int>[384, 672],
   <int>[288, 512],
@@ -148,6 +188,35 @@ class ModnetMattingEngine implements MattingEngine {
     return h <= 0 ? 512 : h;
   }
 
+  /// 在当前 session 上测一次纯推理耗时（ms）。<0 = 测不出来（别据此改任何东西）。
+  Future<int> _benchAt(int w, int h) async {
+    final br = await _send(<String, Object?>{
+      'cmd': 'bench',
+      'id': _seq++,
+      'w': w,
+      'h': h,
+    }, const Duration(seconds: 60));
+    return (br?['ms'] as int?) ?? -1;
+  }
+
+  /// 换配置重开 session 并测一次；返回耗时（ms），失败 -1。
+  Future<int> _reopenAndBench(String path, int tt, String prov, int w, int h,
+      {bool par = false}) async {
+    final rr = await _send(<String, Object?>{
+      'cmd': 'load',
+      'id': _seq++,
+      'path': path,
+      'threads': tt,
+      'size': h,
+      'iw': w,
+      'ih': h,
+      'provider': prov,
+      'par': par,
+    }, const Duration(seconds: 90));
+    if (rr == null || rr['ok'] != true) return -1;
+    return _benchAt(w, h);
+  }
+
   @override
   Future<bool> load() async {
     if (_ready) return true;
@@ -190,6 +259,10 @@ class ModnetMattingEngine implements MattingEngine {
       OrtSession.lastProviders = rtProvs;
       DiagLog.instance.log('MATTING', '运行时执行提供器: ${rtProvs.join("/")}');
 
+      // ★每个失败组合的**原始原因**都攒起来、最后一起上 HUD。
+      //   容器里没有 logcat，而"最后一个成功的组合"会把中间失败原因覆盖掉 ——
+      //   上一版就是这样把 NNAPI 的真实报错吞了，白跑一轮。
+      final fails = <String>[];
       for (final entry in attempts) {
         if (entry[1] != 'CPU' && rtProvs.isNotEmpty) {
           final w = entry[1].toLowerCase();
@@ -203,6 +276,7 @@ class ModnetMattingEngine implements MattingEngine {
             '尝试 ${entry[0]}（provider=${entry[1]}）→ ${path ?? "模型落盘失败"}');
         if (path == null) {
           _lastError = '模型资产落盘失败: ${entry[0]}';
+          fails.add('${entry[1]}:模型落盘失败');
           continue;
         }
         final r = await _send(<String, Object?>{
@@ -218,11 +292,13 @@ class ModnetMattingEngine implements MattingEngine {
         if (r == null) {
           _lastError = 'load 超时/无响应（90s）';
           DiagLog.instance.log('MATTING', _lastError);
+          fails.add('${entry[1]}:超时');
           continue;
         }
         if (r['ok'] != true) {
           _lastError = 'load 失败: ${r['err'] ?? "worker 返回 ok=false"}';
           DiagLog.instance.log('MATTING', _lastError);
+          fails.add('${entry[1]}:${r['err'] ?? "ok=false"}');
           continue;
         }
         final active = (r['provider'] as String?) ?? '';
@@ -230,6 +306,7 @@ class ModnetMattingEngine implements MattingEngine {
         if (entry[0] == kModnetInt8AssetPath && !gotNnapi) {
           // NNAPI 没吃上 → int8 留在 CPU 太慢，worker 会重建 session 换模型
           DiagLog.instance.log('MATTING', 'NNAPI 未生效（$active），弃用 int8');
+          fails.add('${entry[1]}:未生效');
           continue;
         }
         var pickedW = _inWOf(r);
@@ -272,12 +349,78 @@ class ModnetMattingEngine implements MattingEngine {
         }
         _inputW = pickedW;
         _inputH = pickedH;
+
+        // ---- ★CPU 配置实测扫描（纯 CPU 路径才有意义）----
+        // 见 kCpuCfgs 的说明：这些量在桌面和手机上结论相反，只能实测。
+        // 这一步是启动期一次性成本（每组都要重开 session = 重新加载模型），
+        // 换来的是**之后每一帧**的推理时间 —— 而"alpha 多久刷新一次"直接决定
+        // 人动了遮罩跟不跟得上（老板的头号痛点）。
+        var bestMs = -1;
+        var bestLabel = '基线';
+        if (kCfgSweep && !_isAccel(active)) {
+          bestMs = await _benchAt(pickedW, pickedH);
+          DiagLog.instance.log('MATTING',
+              '基线（${entry[0].split('/').last} 顺序 $threads 线程）→ ${bestMs}ms');
+          // ★起点就是"基线配置"，它同样要参与比较与**回滚** ——
+          //   上一版只在"有候选胜出"时才回滚，结果 session 被留在了**最后试的
+          //   那个候选**（并行模式）上：实测推理 202ms → 449ms，整版变慢。
+          var curModel = entry[0];
+          var curPar = false;
+          var curT = threads;
+          var bestModel = entry[0];
+          var bestPar = false;
+          var bestT2 = threads;
+          final t0s = DateTime.now();
+          for (final c in kCpuCfgs) {
+            if (DateTime.now().difference(t0s).inMilliseconds > kSweepBudgetMs) {
+              DiagLog.instance.log('MATTING', '配置扫描超出预算，提前收工');
+              break;
+            }
+            if (c.model == curModel && c.par == curPar && c.threads == curT) {
+              continue;
+            }
+            final mp = await _ensureModelFile(c.model);
+            if (mp == null) continue;
+            final ms = await _reopenAndBench(
+                mp, c.threads, entry[1], pickedW, pickedH, par: c.par);
+            if (ms < 0) continue;
+            curModel = c.model;
+            curPar = c.par;
+            curT = c.threads;
+            DiagLog.instance.log('MATTING', '${c.label} → ${ms}ms');
+            if (bestMs < 0 || ms < bestMs * c.gain) {
+              bestMs = ms;
+              bestLabel = c.label;
+              bestModel = c.model;
+              bestPar = c.par;
+              bestT2 = c.threads;
+            }
+          }
+          // ★无条件确保 session 停在最优配置上（**基线也算**）——
+          //   省掉这一步正是上次"整版变慢"的直接原因，别再省。
+          if (bestModel != curModel || bestPar != curPar || bestT2 != curT) {
+            final mp = await _ensureModelFile(bestModel);
+            if (mp != null) {
+              final back = await _reopenAndBench(
+                  mp, bestT2, entry[1], pickedW, pickedH, par: bestPar);
+              DiagLog.instance.log('MATTING', '回滚到 $bestLabel → ${back}ms');
+            }
+          }
+          DiagLog.instance.log('MATTING', '选定配置 $bestLabel（$bestMs ms）');
+        }
         final model = entry[0] == kModnetInt8AssetPath ? 'int8' : 'fp32';
-        // ★没挂上加速时，把"本机到底注册了哪些提供器"直接写进 HUD ——
-        //   一张截图就能判定「这机器有没有 NPU 可走」，不用再猜。
+        // ★没挂上加速时，把「本机注册了哪些提供器 / 动态轴钉住了没 / 每个组合
+        //   到底报什么错」全写进 HUD —— 一张截图定位完，不用再猜、不用再白跑一轮。
         final provs = (r['providers'] as List?)?.join('/') ?? '';
+        final pin = OrtSession.lastPinLog;
+        var failTxt = fails.join(' | ');
+        if (failTxt.length > 90) failTxt = failTxt.substring(0, 90);
         diag = '$active · $model · ${_inputW}x$_inputH'
-            '${_isAccel(active) ? '' : ' · 可用[$provs]'}';
+            '${bestMs > 0 ? ' · $bestLabel(${bestMs}ms)' : ''}'
+            ' · 库[${OrtSession.probeRuntimeLibs()}]'
+            '${_isAccel(active) ? '' : ' · 可用[$provs]'}'
+            '${_isAccel(active) ? '' : ' · 钉轴[${pin.isEmpty ? "无" : pin}]'}'
+            '${_isAccel(active) || failTxt.isEmpty ? '' : ' · 败[$failTxt]'}';
         _ready = true;
         DiagLog.instance.log('MATTING', 'MODNet 就绪：$diag');
         return true;
@@ -433,6 +576,7 @@ Future<void> _modnetWorker(SendPort replyPort) async {
           preferW: msg['iw'] as int?,
           preferH: msg['ih'] as int?,
           preferProvider: (msg['provider'] as String?) ?? 'XNNPACK',
+          parMode: (msg['par'] as bool?) ?? false,
         );
         final s = sess;
         if (s == null) {
@@ -484,6 +628,11 @@ Future<void> _modnetWorker(SendPort replyPort) async {
         final bw = msg['w'] as int;
         final bh = msg['h'] as int;
         final dummy = Uint8List(bw * bh * 3);
+        // ★必须用**有纹理**的假图：全 0 输入会让访存/缓存表现过于理想
+        //   （实测基线 bench 说 98ms、真跑却 449ms，差 4 倍，就是被它骗的）。
+        for (int q = 0; q < dummy.length; q++) {
+          dummy[q] = (q * 37 + (q >> 5) * 11) & 0xFF;
+        }
         var best = -1;
         var err = '';
         if (s != null) {

@@ -150,8 +150,15 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   // ---- ★两次 alpha 之间的"连续跟随"（治"人一动就露出大块背景"）----
   Uint8List? _maskBaseGray; // 已发布遮罩对应的那一帧的灰度（拷贝）
   Uint8List? _maskWeight; // 人像区域权重（灰度分辨率；1=人）
-  GlobalShift? _liveShift; // 本帧估出的"人像整体位移"（灰度像素）
+  GlobalShift? _liveShift; // （已停用：改由 _tickMaskWarp 逐帧逐块外推）
   bool _liveShiftMs = false; // 本帧是否真的做了跟随（诊断标记，放 HUD）
+
+  /// ★已发布遮罩的**未外推**整形结果（= 推理那一帧的人像姿态）。
+  /// 每个显示帧都以它为基准、用"基准帧→现在"的运动场重新外推并重发一次遮罩 ——
+  /// 基准固定，所以**没有累积漂移**。
+  Float32List? _maskBaseAlpha;
+  DateTime? _lastWarpAt; // 逐帧外推的节流（~16fps 足够）
+  int _warpFrameMs = 0; // 逐帧外推一次吃了多少 ms（诊断）
 
   /// ★运行时诊断开关：默认关（画面干净、也省 CPU）。
   /// **长按右上角"AI 抠像 x.xfps"角标**即可随时开/关 ——
@@ -468,7 +475,9 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         preferW: _aiInW,
         preferH: _aiInH,
       );
-      final ok = await e.load().timeout(const Duration(seconds: 45));
+      // ★超时放到 100s：引擎在开播前会做一次"配置实测扫描"（模型×执行模式×线程数
+      //   逐个重开 session 计时），启动会慢十几秒，那是**一次性**成本。
+      final ok = await e.load().timeout(const Duration(seconds: 100));
       if (!mounted) {
         await e.dispose();
         return;
@@ -700,34 +709,69 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 为什么必须有它：alpha 只有 ~3fps（350ms 一张）。两张之间人还在动，
   /// 遮罩却停在原地 —— 那段空档就是"人一动就露出的大块背景"。
   /// 这里用 ~12fps 的频率把已发布的遮罩整体挪一下，跟随频率提高约 4 倍。
-  void _updateLiveShift() {
-    if (!kMotionComp) return;
-    final bg = _maskBaseGray, cg = _grayCur, wt = _maskWeight;
-    if (bg == null || cg == null || wt == null || bg.length != cg.length) {
-      _liveShift = null;
-      _liveShiftMs = false;
-      return;
-    }
-    final s = estimateMaskShift(bg, cg, _grayW, _grayH, wt, 18);
-    _liveShift = s;
-    _liveShiftMs = s != null;
+  /// ★逐帧把遮罩从"推理那一帧"外推到"当前帧"（基准帧固定 → 无累积漂移）。
+  ///
+  /// 为什么值得做：AI 只有 ~4fps，人一动，遮罩最久要 ~250ms 才更新形状 ——
+  /// 这正是老板说的"移动时抠像就延迟跟着"的根。
+  /// 逐块运动场只要 ~1ms、"外推+重发一张遮罩"约 10ms，所以在**显示帧率**上
+  /// 重发是付得起的，跟随感直接上一个档。
+  ///
+  /// 它取代了原来的 `_updateLiveShift`（那只做"人像整体平移"，抓不住手脚的
+  /// 局部运动，而且和逐帧外推基准相同、叠加会**重复补偿**）。
+  void _tickMaskWarp() {
+    if (!kMotionComp || !kGpuComposite) return;
+    if (_alphaImgBusy) return; // 上一张还没解好，别往上堆
+    final base = _maskBaseAlpha;
+    final eng = _engine;
+    final cg = _grayCur;
+    final bg = _maskBaseGray;
+    if (base == null || eng == null || cg == null || bg == null) return;
+    if (bg.length != cg.length || _grayW <= 0 || _grayH <= 0) return;
+    final iw = eng.inputW, ih = eng.inputH;
+    if (base.length < iw * ih) return;
+    // ★节流 + **不动的帧直接不干活**。
+    //   这台机器上 UI 线程和推理抢同一份 CPU：外推一次要估运动场 + 外推 + 重发
+    //   遮罩（约 25ms），密到每帧都做会把 CPU 从推理手里抢走 —— 实测推理被拖到
+    //   449ms，反而更卡。所以：位移小到没意义的帧一律跳过。
+    final now = DateTime.now();
+    final last = _lastWarpAt;
+    if (last != null && now.difference(last).inMilliseconds < 100) return;
+    final sw = Stopwatch()..start();
+    final f = MotionEstimator.estimate(bg, cg, _grayW, _grayH, _grayW / iw);
+    // 找不到可信运动 / 估计跑飞 → 本帧不重发（退回"沿用上一张遮罩"的老行为）
+    if (f == null || f.rmsModel() > 45) return;
+    // 最大位移不到 1.5 个模型像素（画面宽度的 0.8%）→ 肉眼看不出来，跳过
+    if (f.maxModel() < 1.5) return;
+    final w = _warpAlpha(base, iw, ih, f);
+    _lastWarpAt = now;
+    _warpFrameMs = sw.elapsedMicroseconds ~/ 1000;
+    _publishAlpha(w, iw, ih);
   }
 
   /// 记下"这张遮罩是相对哪一帧算的"（灰度拷贝 + 人像权重），供连续跟随用。
   /// 发布新遮罩后必须调一次，否则跟随会基于旧基准、把位移重复叠加。
   void _refreshMaskBase(Float32List alpha, int aw, int ah) {
+    // [alpha] 必须是**未外推**的整形结果（外面传的是 shapeAlpha 的新表）。
     final cg = _grayCur;
+    final rg = _grayReq; // ★推理那一帧的灰度（alpha 对应的就是它）
     if (!kMotionComp ||
         cg == null ||
+        rg == null ||
+        rg.length != cg.length ||
         _grayW <= 0 ||
         _grayH <= 0 ||
         alpha.length < aw * ah) {
       _maskBaseGray = null;
       _maskWeight = null;
+      _maskBaseAlpha = null;
       _liveShift = null;
+      _liveShiftMs = false;
       return;
     }
-    _maskBaseGray = Uint8List.fromList(cg);
+    _maskBaseAlpha = alpha;
+    // ★基准灰度用**推理那一帧**（_grayReq），不是"发布那一刻的当前帧"：
+    //   这样逐帧外推算的就是"基准帧 → 现在"，与 _maskBaseAlpha 的姿态严格对应。
+    _maskBaseGray = Uint8List.fromList(rg);
     final wt = (_maskWeight != null && _maskWeight!.length == cg.length)
         ? _maskWeight!
         : (_maskWeight = Uint8List(cg.length));
@@ -1035,7 +1079,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         '均值${(sum / n).toStringAsFixed(2)} '
         '最低${mn.toStringAsFixed(2)} 最高${mx.toStringAsFixed(2)}'
         '${_dilateDbg ? ' 涨边+1' : ''}'
-        '${_engine != null && _engine!.lastInferMs > 0 ? ' 推${_engine!.lastInferMs}ms' : ''}';
+        '${_engine != null && _engine!.lastInferMs > 0 ? ' 推${_engine!.lastInferMs}ms' : ''}'
+        '${_warpFrameMs > 0 ? ' 外${_warpFrameMs}ms' : ''}';
   }
 
   Future<void> _onFrame(
@@ -1104,8 +1149,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         // ★运动补偿：顺手做一张一半大小的灰度图（每帧一遍、零分配）
         if (kMotionComp) {
           _buildGray(rgb, iw, ih);
-          // ★每帧估一次"人像整体位移" —— 两次 alpha 之间的空档靠它顶住
-          _updateLiveShift();
+          // ★每个显示帧都把遮罩外推到"当前帧"（见 _tickMaskWarp 的说明）。
+          //   以前只在"新 alpha 到手时"估一次运动场，两次之间只用一个"人像整体
+          //   平移"顶着 —— 所以人一动，遮罩要等最久 ~250ms 才真正跟上。
+          _tickMaskWarp();
         }
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
         // ★运动量：与上一帧输入图逐点比较（跳点采样，开销可忽略）
@@ -1215,13 +1262,14 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               if (kGpuComposite) {
                 // ★先整形（区域清理 + 羽化），再按运动场外推到当前帧。
                 //   顺序不能反：区域清理要在"可信的原始 alpha"上做。
-                var alpha = shapeAlpha(a, iw, ih, widget.strength);
+                final baseA = shapeAlpha(a, iw, ih, widget.strength);
                 _estimateFlow(iw);
                 final fl = _flow;
-                if (fl != null) alpha = _warpAlpha(alpha, iw, ih, fl);
-                _publishAlpha(alpha, iw, ih);
-                // ★这张遮罩是"相对当前帧"算的 → 把当前帧设为连续跟随的新基准
-                _refreshMaskBase(alpha, iw, ih);
+                _publishAlpha(
+                    fl == null ? baseA : _warpAlpha(baseA, iw, ih, fl), iw, ih);
+                // ★基准存"**未外推**的整形结果" + 推理那一帧的灰度（见 _refreshMaskBase）。
+                //   之后每个显示帧都从这套基准重新估运动场并重发遮罩。
+                _refreshMaskBase(baseA, iw, ih);
               }
             } else if (eng.errorStreak > 0) {
               // 引擎「忙」不是错误；只有真的连续报错才计数 → 到阈值熔断
@@ -1502,6 +1550,17 @@ void _nv21ToRgbaScaled(
     Uint8List nv21, int w, int h, Uint8List out, int dw, int dh) {
   final frameSize = w * h;
   final xr = w / dw, yr = h / dh;
+  // ★UI 减负：列映射只与**列**有关（每一行都一样）→ 预计算一次查表。
+  //   原来每个像素都要做一次浮点乘 + toInt + 边界判断（每帧 92 万次）；
+  //   而 UI 线程的每一毫秒都是跟 AI 推理抢来的（这台机器上两者共用一份 CPU，
+  //   抠像 14fps×56ms + 推理 3.9×202ms 已经超过 1 秒/秒）。
+  final colSx = Int32List(dw);
+  final colSx1 = Int32List(dw);
+  for (int i = 0; i < dw; i++) {
+    final sx = (i * xr).toInt();
+    colSx[i] = sx;
+    colSx1[i] = sx + 1 < w ? sx + 1 : w - 1;
+  }
   var o = 0;
   for (int j = 0; j < dh; j++) {
     final sy = (j * yr).toInt();
@@ -1510,8 +1569,8 @@ void _nv21ToRgbaScaled(
     final uvRow = frameSize + (sy >> 1) * w;
     final uvRow1 = frameSize + (sy1 >> 1) * w;
     for (int i = 0; i < dw; i++) {
-      final sx = (i * xr).toInt();
-      final sx1 = sx + 1 < w ? sx + 1 : w - 1;
+      final sx = colSx[i];
+      final sx1 = colSx1[i];
       // ★2×2 盒式平均：1.5 倍降采样直接用最近邻会出摩尔纹/锯齿，
       //   模型输入一旦有锯齿，遮罩边缘就会随晃动忽好忽坏。
       var y = ((nv21[yRow + sx] & 0xff) +
