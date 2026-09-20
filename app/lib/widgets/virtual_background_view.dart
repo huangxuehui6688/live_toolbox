@@ -115,11 +115,69 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   /// 是唯一能把真实现场带回电脑的通道。排障期显示，发版靠 kDiagLogOn 关掉。
   String _dbgPanel = '';
 
+  // ===== ★地面真相可视化：模型输入 + 模型原始输出（都只给排障用）=====
+  Uint8List? _dbgInRgb; // 最近一次真正喂给模型的 RGB 副本
+  int _dbgInW = 0, _dbgInH = 0;
+  Float32List? _dbgRawA; // 最近一次模型原始输出（未经 EMA / shapeAlpha）
+  ui.Image? _dbgImgIn;
+  ui.Image? _dbgImgA;
+  int _dbgImgSeq = 0;
+  String _geoDbg = ''; // 几何参数（帧/朝向/旋转/镜像/各段尺寸）
+
+  /// 把「模型输入」与「模型原始输出」各做一张小图，画在屏幕上。
+  void _dbgMakeImages() {
+    if (!kDiagLogOn) return;
+    final rgb = _dbgInRgb, a = _dbgRawA;
+    final w = _dbgInW, h = _dbgInH;
+    if (rgb == null || a == null || w <= 0 || h <= 0) return;
+    final n = w * h;
+    if (rgb.length < n * 3 || a.length < n) return;
+    final seq = ++_dbgImgSeq;
+    final rgbaIn = Uint8List(n * 4);
+    for (int i = 0, p = 0, q = 0; i < n; i++) {
+      rgbaIn[q++] = rgb[p++];
+      rgbaIn[q++] = rgb[p++];
+      rgbaIn[q++] = rgb[p++];
+      rgbaIn[q++] = 255;
+    }
+    final rgbaA = Uint8List(n * 4);
+    for (int i = 0, q = 0; i < n; i++) {
+      final v = (a[i] * 255.0).clamp(0.0, 255.0).toInt();
+      rgbaA[q++] = v;
+      rgbaA[q++] = v;
+      rgbaA[q++] = v;
+      rgbaA[q++] = 255;
+    }
+    ui.decodeImageFromPixels(rgbaIn, w, h, ui.PixelFormat.rgba8888, (im) {
+      if (!mounted || seq != _dbgImgSeq) {
+        im.dispose();
+        return;
+      }
+      final old = _dbgImgIn;
+      setState(() => _dbgImgIn = im);
+      if (old != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+      }
+    });
+    ui.decodeImageFromPixels(rgbaA, w, h, ui.PixelFormat.rgba8888, (im) {
+      if (!mounted || seq != _dbgImgSeq) {
+        im.dispose();
+        return;
+      }
+      final old = _dbgImgA;
+      setState(() => _dbgImgA = im);
+      if (old != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+      }
+    });
+  }
+
   void _dbg(String what) {
     if (!kDiagLogOn) return;
     final e = _engine;
     final buf = <String>[
       '$what',
+      if (_geoDbg.isNotEmpty) _geoDbg,
       '引擎=${e == null ? "null" : "ok"} in=${e?.inputW}x${e?.inputH} '
           '提供器=${e?.diag ?? "-"}',
       'fail=$_aiFail/$kAiFailLimit 加载失败=$_loadFails 在途=$_aiReqPending '
@@ -421,6 +479,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     final mh = uh >= uw ? 256 : math.max(8, (256 * uh / uw).round());
     final af = sampleAffine(uw, uh, aw, ah);
     final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
+    if (kDiagLogOn) {
+      final rd = (360 - _frameOrientation) % 360;
+      _geoDbg = '帧 $uw x$uh (原 ${f.width.toInt()}x${f.height.toInt()} '
+          '朝向$_frameOrientation rot$rd 镜像${widget.mirror && _frameMirror ? 1 : 0})'
+          ' · 模型入 $aw x$ah · 遮罩图 $mw x$mh · 仿射 aX$aX bX${bX.toStringAsFixed(2)}'
+          ' bY${bY.toStringAsFixed(2)}';
+    }
     _alphaImgBusy = true;
     final px = Uint8List(mw * mh * 4);
     final awf = aw - 1, ahf = ah - 1;
@@ -703,9 +768,21 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         // ★相机给的是「传感器原始横版」buffer，必须按 sensorOrientation 转正，
         //   否则模型看到的是侧躺的人，抠像质量会明显变差。
         final rgb = _aiRgbOf(iw * ih);
-        final rotDeg = (360 - orientation) % 360;
+        // ★★ 旋转约定必须跟随"预览实际显示的朝向"，否则模型看到的是倒的：
+        //   GPU 路径下的人像层是**相机纹理**（由 camerax 插件旋转，= 传感器朝向本身）；
+        //   老 CPU 路径是 painter 自己 。
+        //   两者对 90/270 恰好差 180°。真机截图实测：用 (360-朝向) 时模型输入整幅
+        //   倒置（诊断图里人脸朝下、天花板在上）→ 抠出的遮罩与画面上下颠倒、怎么调
+        //   边缘都对不上。这里按路径取正确的那个约定。
+        final rotDeg = kGpuComposite ? orientation : (360 - orientation) % 360;
         _sampleSquareRgb(rgba, w, h, rotDeg, iw, ih, rgb);
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
+        if (kDiagLogOn && !_aiReqPending) {
+          // 留一份给"地面真相"面板（复用缓冲会被下一帧覆盖）
+          _dbgInRgb = Uint8List.fromList(rgb);
+          _dbgInW = iw;
+          _dbgInH = ih;
+        }
 
         // ---- ★★ 出画与推理解耦（不然手机端会掉成幻灯片）★★ ----
         // 反例：如果这里 `await eng.matting(...)`，那么一次推理 200~400ms 期间
@@ -724,6 +801,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
             if (!mounted || myGen != _camGen) return;
             if (a != null && a.length == iw * ih) {
               _aiFail = 0; // ★跑通了 → 连续失败计数清零
+              if (kDiagLogOn) {
+                _dbgRawA = Float32List.fromList(a); // 原始输出（整形前）
+                _dbgMakeImages();
+              }
               // ★帧间平滑（EMA）：新帧 65% + 上一帧 35%。AI 只有 8fps，
               //   逐帧 alpha 抖动（边缘忽有忽无/闪烁）被明显压平；
               //   代价是边缘响应稍慢一拍，与"跳帧插值"的滞后同量级。
@@ -864,6 +945,43 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           ),
         ),
       ),
+      // ★地面真相面板：模型输入 vs 模型原始输出（同尺寸并排，人像对不齐就说明是模型/采样问题）
+      if (kDiagLogOn && (_dbgImgIn != null || _dbgImgA != null))
+        Positioned(
+          top: MediaQuery.paddingOf(context).top + 104,
+          left: 8,
+          child: Container(
+            padding: const EdgeInsets.all(6),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: .78),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('左=模型看到的画面   右=模型原始输出',
+                    style: TextStyle(color: Colors.white70, fontSize: 9)),
+                const SizedBox(height: 3),
+                Row(mainAxisSize: MainAxisSize.min, children: [
+                  if (_dbgImgIn != null)
+                    RawImage(
+                        image: _dbgImgIn,
+                        width: 128,
+                        height: 234,
+                        fit: BoxFit.fill),
+                  const SizedBox(width: 6),
+                  if (_dbgImgA != null)
+                    RawImage(
+                        image: _dbgImgA,
+                        width: 128,
+                        height: 234,
+                        fit: BoxFit.fill),
+                ]),
+              ],
+            ),
+          ),
+        ),
       // ★端侧排障面板（底部）：把引擎真实错误显示在画面上，供截图回传
       if (kDiagLogOn && _dbgPanel.isNotEmpty)
         Positioned(
