@@ -27,6 +27,18 @@ const bool kFullFrameInput = true;
 /// 画面却 100% 进模型 —— 这是覆盖率和帧率之间比较划算的一档。
 const int kAiInputWidth = 192;
 
+/// ★诊断开关：把"模型看到的画面"按**遮罩同一套映射**半透明叠到实时预览上。
+/// 用来直接测量"预览纹理的真实映射"与"代码假设映射"的偏差（偏移/缩放/镜像）。
+/// 只在排障期开，配 kDiagLogOn 一起关。
+const bool kDiagOverlayInput = true;
+
+/// 叠加时同时画"镜像后"的那一套（绿色），用于一眼判断该用哪套映射。
+const bool kDiagOverlayBoth = true;
+
+/// ★出画帧的宽度（采集帧会缩放到这个宽度）。1280（≈720p）是画质与耗时的平衡点：
+/// 显示与模型都吃这一张，几何按构造一致，不再依赖"相机预览纹理"的任何假设。
+const int kFrameOutWidth = 1280;
+
 /// ★把模型输入尺寸对齐到 32 的倍数。
 ///
 /// 为什么必须对齐：MODNet 内部有 5 次 stride-2 下采样（总 /32）。某个维度不是
@@ -481,10 +493,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     final aX = af[0], bX = af[1], aY = af[2], bY = af[3];
     if (kDiagLogOn) {
       final rd = (360 - _frameOrientation) % 360;
-      _geoDbg = '帧 $uw x$uh (原 ${f.width.toInt()}x${f.height.toInt()} '
-          '朝向$_frameOrientation rot$rd 镜像${widget.mirror && _frameMirror ? 1 : 0})'
-          ' · 模型入 $aw x$ah · 遮罩图 $mw x$mh · 仿射 aX$aX bX${bX.toStringAsFixed(2)}'
-          ' bY${bY.toStringAsFixed(2)}';
+      final pv = _camera?.value.previewSize;
+      _geoDbg = '预览分辨率 $pv | 帧buffer ${f.width.toInt()}x${f.height.toInt()}'
+          ' | 转正 $uw x$uh | 模型入 $aw x$ah | 遮罩图 $mw x$mh'
+          ' | 朝向$_frameOrientation rot$rd 镜像${widget.mirror && _frameMirror ? 1 : 0}'
+          ' | aX$aX bX${bX.toStringAsFixed(3)} bY${bY.toStringAsFixed(3)}';
     }
     _alphaImgBusy = true;
     final px = Uint8List(mw * mh * 4);
@@ -572,11 +585,17 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   ///   否则会转两次。
   /// * 该插件**不自动镜像前置摄像头** —— 老 CPU 路径是在 `_CompositePainter` 里
   ///   `canvas.scale(-1, 1)` 翻的。GPU 层必须自己翻，否则画面与 alpha 遮罩左右错开。
-  Widget _cameraTextureLayer(bool mirror) {
-    final cam = _camera;
-    if (cam == null || !cam.value.isInitialized) return const SizedBox.shrink();
-    Widget p = CameraPreview(cam); // 官方预览：已转正、比例正确
+  Widget _frameImageLayer(bool mirror) {
+    final img = _frame;
+    if (img == null) return const SizedBox.shrink();
+    // ★帧是**传感器横版**（如 1280×720），要按传感器朝向转正后再铺满
+    final turns = ((360 - _frameOrientation) % 360) ~/ 90;
+    Widget p = RotatedBox(
+      quarterTurns: turns % 4,
+      child: RawImage(image: img, fit: BoxFit.fill),
+    );
     if (mirror) {
+      // 与 CPU painter 一致：镜像作用在**转正之后**的画面空间里
       p = Transform(
         alignment: Alignment.center,
         transform: Matrix4.diagonal3Values(-1.0, 1.0, 1.0),
@@ -629,32 +648,74 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   Widget _gpuComposite() {
     final rotDeg = (360 - _frameOrientation) % 360;
     final mirror = widget.mirror && _frameMirror;
-    final person = _beauty(_cameraTextureLayer(mirror));
+    final person = _beauty(_frameImageLayer(mirror));
     final alpha = _alphaImg;
     // 实景（不抠像）：纹理直出，CPU 一帧都不用碰
     if (!_useAi) {
-      return _needBackground
+      final w = _needBackground
           ? Stack(fit: StackFit.expand,
               children: [_backgroundLayer(), person])
           : person;
+      return _withDiagOverlay(w, rotDeg, mirror);
     }
     // AI 抠像：第一帧 alpha 还没出来时先原样显示（不黑屏），之后上遮罩
-    if (alpha == null) return person;
-    return Stack(fit: StackFit.expand, children: [
-      if (_needBackground) _backgroundLayer(),
-      ShaderMask(
-        blendMode: BlendMode.dstIn,
-        shaderCallback: (Rect bounds) => ui.ImageShader(
-          alpha,
-          TileMode.clamp,
-          TileMode.clamp,
-          _maskMatrix(bounds.width, bounds.height, rotDeg, mirror, alpha.width,
-                  alpha.height)
-              .storage,
+    if (alpha == null) return _withDiagOverlay(person, rotDeg, mirror);
+    return _withDiagOverlay(
+      Stack(fit: StackFit.expand, children: [
+        if (_needBackground) _backgroundLayer(),
+        ShaderMask(
+          blendMode: BlendMode.dstIn,
+          shaderCallback: (Rect bounds) => ui.ImageShader(
+            alpha,
+            TileMode.clamp,
+            TileMode.clamp,
+            _maskMatrix(bounds.width, bounds.height, rotDeg, mirror,
+                    alpha.width, alpha.height)
+                .storage,
+          ),
+          child: person,
         ),
-        child: person,
-      ),
-    ]);
+      ]),
+      rotDeg,
+      mirror,
+    );
+  }
+
+  /// ★诊断叠层：把「模型看到的画面」用**与遮罩完全相同的那套矩形映射**画出来。
+  /// 若它与实时画面里的人和物重合 → 预览映射与假设一致（问题在别处）；
+  /// 若整体错开/缩放 → 一眼就能读出偏移量。
+  Widget _withDiagOverlay(Widget child, int rotDeg, bool mirror) {
+    if (!kDiagLogOn || !kDiagOverlayInput) return child;
+    return LayoutBuilder(builder: (BuildContext ctx, BoxConstraints c) {
+      // 红 = 代码当前用的映射（mirror）；绿 = 镜像后的映射。
+      // 谁和实时画面的人重合，就说明该用哪一套 —— 一次截图即可定性。
+      Matrix4 mm(bool flip) => _maskMatrix(c.maxWidth, c.maxHeight, rotDeg, flip,
+          _dbgImgIn!.width, _dbgImgIn!.height);
+      return Stack(fit: StackFit.expand, children: [
+        child,
+        if (_dbgImgIn != null)
+          IgnorePointer(
+            child: Opacity(
+              opacity: 0.6,
+              child: Stack(fit: StackFit.expand, children: [
+                if (kDiagOverlayBoth)
+                  CustomPaint(
+                    painter: _MatrixImagePainter(_dbgImgIn!, mm(!mirror).storage,
+                        const Color(0xFF30FF30)),
+                  ),
+                CustomPaint(
+                  painter: _MatrixImagePainter(
+                      _dbgImgIn!,
+                      mm(mirror).storage,
+                      kDiagOverlayBoth
+                          ? const Color(0xFFFF3030)
+                          : const Color(0xFFFFFFFF)),
+                ),
+              ]),
+            ),
+          ),
+      ]);
+    });
   }
 
   /// 老路径（CPU 全分辨率合成）：合成、色布、以及 kGpuComposite=false 时用
@@ -749,14 +810,13 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
     try {
       final w = image.width;
       final h = image.height;
+      // ★★ 出画与模型共用同一张帧：按 kFrameOutWidth 缩放（默认 ≈720p）
+      final fw = w > kFrameOutWidth ? kFrameOutWidth : w;
+      final fh = w > kFrameOutWidth ? (h * kFrameOutWidth / w).round() : h;
       // camerax 输出的是 YUV_420_888 三平面，需拼接成 NV21 单缓冲（Y + VU 交错）
-      // ★B：GPU 合成时，实景/色布（不跑模型）连 RGBA 都不用转 —— CPU 一帧都不碰
-      final needRgba = useAi || widget.keyColor >= 0 || !kGpuComposite;
-      final rgba = _rgbaOf(w, h);
-      if (needRgba) {
-        final nv21 = _yuvPlanesToNv21(image);
-        _nv21ToRgbaInto(nv21, w, h, rgba);
-      }
+      final rgba = _rgbaOf(fw, fh);
+      final nv21 = _yuvPlanesToNv21(image);
+      _nv21ToRgbaScaled(nv21, w, h, rgba, fw, fh);
       msRgb = DateTime.now().difference(tStart).inMilliseconds;
 
       ui.Image? img;
@@ -775,7 +835,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         //   倒置（诊断图里人脸朝下、天花板在上）→ 抠出的遮罩与画面上下颠倒、怎么调
         //   边缘都对不上。这里按路径取正确的那个约定。
         final rotDeg = kGpuComposite ? orientation : (360 - orientation) % 360;
-        _sampleSquareRgb(rgba, w, h, rotDeg, iw, ih, rgb);
+        _sampleSquareRgb(rgba, fw, fh, rotDeg, iw, ih, rgb);
         msSample = DateTime.now().difference(tStart).inMilliseconds - msRgb;
         if (kDiagLogOn && !_aiReqPending) {
           // 留一份给"地面真相"面板（复用缓冲会被下一帧覆盖）
@@ -841,28 +901,30 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           final a = _prevAlpha;
           if (a != null && a.length == iw * ih) {
             // ★alpha 与画面同坐标系（整幅缩放的逆变换），贴回按同一套仿射
-            _applySoftAlpha(rgba, a, iw, ih, widget.strength, w, h, rotDeg);
+            _applySoftAlpha(rgba, a, iw, ih, widget.strength, fw, fh, rotDeg);
           }
           msAlpha = tA.difference(tStart).inMilliseconds - msRgb - msSample;
-          img = await _decode(rgba, w, h);
+          img = await _decode(rgba, fw, fh);
           msDecode = DateTime.now().difference(tA).inMilliseconds;
+        } else {
+          // GPU 路径：画面就是**这张帧**（不再是相机纹理）→ 必须解码出图，
+          // 遮罩仍由 ShaderMask 在 GPU 完成（不做 CPU 全分辨率合成）
+          final tA2 = DateTime.now();
+          img = await _decode(rgba, fw, fh);
+          msDecode = DateTime.now().difference(tA2).inMilliseconds;
         }
-        // GPU 路径：什么都不用做 —— rgba 只用来喂模型，画面由 Texture + 遮罩在 GPU 合成
       } else {
-        // 色布模式：只做真·色键；实景模式（不抠像）什么都不做
-        if (widget.keyColor >= 0 || !kGpuComposite) {
-          if (widget.keyColor >= 0) {
-            _applyChromaKey(rgba, w, h, widget.keyColor, widget.strength);
-            _premultiply(rgba, w, h);
-          }
-          final tA = DateTime.now();
-          img = await _decode(rgba, w, h);
-          msDecode = DateTime.now().difference(tA).inMilliseconds;
+        // 色布模式：先做真·色键（CPU，只服务色布）；实景模式无需处理
+        if (widget.keyColor >= 0) {
+          _applyChromaKey(rgba, fw, fh, widget.keyColor, widget.strength);
+          _premultiply(rgba, fw, fh);
         }
-        // GPU 路径的实景/色布（无遮罩）：画面直接来自 Texture，不必转码解码
+        final tA = DateTime.now();
+        img = await _decode(rgba, fw, fh);
+        msDecode = DateTime.now().difference(tA).inMilliseconds;
       }
       if (!mounted || gen != _camGen) {
-        img?.dispose();
+        img.dispose();
         return;
       }
 
@@ -875,7 +937,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           //   而 90° 旋转 + 去镜像 = 视觉上转 180° → 就是"先倒立一下"的真正原因
           _frameMirror = isFront;
           // ★GPU 路径要这两样算 cover 比例：原始 buffer 尺寸 + 出过帧标记
-          _frameSize = Size(w.toDouble(), h.toDouble());
+          _frameSize = Size(fw.toDouble(), fh.toDouble());
           _hasFrame = true;
           _frames++;
           final now = DateTime.now();
@@ -905,7 +967,10 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           }
         });
       }
-      old?.dispose();
+      // ★必须等下一帧画完再释放：新帧图像这一帧已被 GPU 引用
+      if (old != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+      }
     } catch (e) {
       // 技术细节只进日志；界面不显示英文异常（排障面板除外）
       _dbg('单帧异常: $e');
@@ -1076,26 +1141,32 @@ Uint8List _yuvPlanesToNv21(CameraImage image) {
 
 /// NV21 → RGBA 写入调用方给的缓冲（每像素 4 字节，alpha 先置 255）。
 /// 缓冲由 State 跨帧复用，避免每帧分配 w*h*4 字节触发 GC 抖动。
-void _nv21ToRgbaInto(Uint8List nv21, int w, int h, Uint8List out) {
+/// NV21 → RGBA，并直接缩放到 (dw×dh)（最近邻取样，一趟完成缩放+色彩转换）。
+/// ★出画与模型共用这一张，避免"预览纹理 vs 采集帧"的数据流不一致。
+void _nv21ToRgbaScaled(
+    Uint8List nv21, int w, int h, Uint8List out, int dw, int dh) {
   final frameSize = w * h;
-  for (int j = 0, yp = 0; j < h; j++) {
-    int uvp = frameSize + (j >> 1) * w, u = 0, v = 0;
-    for (int i = 0; i < w; i++, yp++) {
-      int y = (nv21[yp] & 0xff) - 16;
+  final xr = w / dw, yr = h / dh;
+  var o = 0;
+  for (int j = 0; j < dh; j++) {
+    final sy = (j * yr).toInt();
+    final yRow = (sy < h ? sy : h - 1) * w;
+    final uvRow = frameSize + ((sy >> 1) < (h >> 1) ? (sy >> 1) : (h >> 1) - 1) * w;
+    for (int i = 0; i < dw; i++) {
+      final sx = (i * xr).toInt();
+      final sxv = sx < w ? sx : w - 1;
+      var y = (nv21[yRow + sxv] & 0xff) - 16;
       if (y < 0) y = 0;
-      if ((i & 1) == 0) {
-        v = (nv21[uvp++] & 0xff) - 128;
-        u = (nv21[uvp++] & 0xff) - 128;
-      }
+      // NV21：VU 交错，一对色度管 2 个像素 → 取偶数下标
+      final cu = uvRow + (sxv & ~1);
+      final v = (nv21[cu] & 0xff) - 128;
+      final u = (nv21[cu + 1] & 0xff) - 128;
       final y1192 = 1192 * y;
-      final r = y1192 + 1634 * v;
-      final g = y1192 - 833 * v - 400 * u;
-      final b = y1192 + 2066 * u;
-      final o = (j * w + i) * 4;
-      out[o] = _clamp(r >> 10);
-      out[o + 1] = _clamp(g >> 10);
-      out[o + 2] = _clamp(b >> 10);
+      out[o] = _clamp((y1192 + 1634 * v) >> 10);
+      out[o + 1] = _clamp((y1192 - 833 * v - 400 * u) >> 10);
+      out[o + 2] = _clamp((y1192 + 2066 * u) >> 10);
       out[o + 3] = 255;
+      o += 4;
     }
   }
 }
@@ -1203,6 +1274,36 @@ void _sampleSquareRgb(Uint8List rgba, int w, int h, int rotDeg, int iw, int ih,
           .round());
     }
   }
+}
+
+/// ★诊断用画笔：把一张图按**与遮罩 ImageShader 完全相同的矩阵**画到画布上。
+/// 矩阵来自 `_maskMatrix`（图片坐标 → 视图坐标），所以画出来的位置就是"代码认为
+/// 画面应该在哪"，与实时画面一比即知真实映射差多少。
+class _MatrixImagePainter extends CustomPainter {
+  _MatrixImagePainter(this.img, this.m, this.tint);
+
+  final ui.Image img;
+  final Float64List m;
+
+  /// 着色（modulate）：红/绿各画一份，便于在画面上区分两套映射
+  final Color tint;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.save();
+    canvas.transform(m);
+    canvas.drawImage(
+        img,
+        Offset.zero,
+        Paint()
+          ..filterQuality = FilterQuality.medium
+          ..colorFilter = ColorFilter.mode(tint, BlendMode.modulate));
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_MatrixImagePainter old) =>
+      old.img != img || old.tint != tint || old.m != m;
 }
 
 int _clamp(int v) => v < 0 ? 0 : (v > 255 ? 255 : v);
