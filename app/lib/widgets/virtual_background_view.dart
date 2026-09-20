@@ -126,6 +126,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   // ---- ★运动补偿（光流/块匹配）----
   Uint8List? _grayCur; // 当前帧灰度小图（模型输入空间 ÷2，如 96×176）
   Uint8List? _grayReq; // 发推理请求那一帧的灰度小图（拷贝留底）
+  Uint8List? _prevReqGray; // 上一次请求那一帧的灰度（逐像素平滑的参照）
   int _grayW = 0, _grayH = 0;
   MotionField? _flow; // 最近一次估出的运动场
   Float32List? _warpBuf; // alpha 外推的复用缓冲（避免每次分配）
@@ -1123,6 +1124,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
           final payload = Uint8List.fromList(rgb);
           // ★留一份"这一帧"的灰度：等 alpha 回来时和"当前帧"比对，估出运动场
           if (kMotionComp && _grayCur != null) {
+            _prevReqGray = _grayReq; // 上一张留给"逐像素平滑"做参照
             _grayReq = Uint8List.fromList(_grayCur!);
           }
           final myGen = gen;
@@ -1145,30 +1147,44 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               // ★帧间平滑：权重按"运动量"自适应；静止时若面积突变则只吃 25%
               //   （模型偶尔会跑偏整帧 —— 晃一下/遮挡一下就出现，直接采用就是
               //    "原始输出偶尔不准"。这里用面积跳变 + 几乎没运动 判定为异常帧）
+              // ★★ 逐像素的运动自适应平滑（取代原来的"全局运动量"版本）
+              //
+              // 为什么必须逐像素：旧版用**全画幅平均动度**算一个统一权重。人坐着不动、
+              // 只把手举起来时，全局动度很小 → 判定"静止" → 权重被压到 0.55，甚至被
+              // "面积突变抑制"压到 0.25 → **刚出现的那只手 alpha 被老帧稀释**。
+              // 真机实测：举起来的手掌变半透明、背景从手里透出来（就是"还是露出背景"）。
+              //
+              // 现在按「这张输入 vs 上一张输入的逐点差异」决定：**哪里变了就信新 alpha**
+              // （差异大 → 权重→1），哪里没变才继续平滑（保底 0.55，压静止噪声）。
               final old = _prevAlpha;
               if (old != null && old.length == a.length) {
-                double sumNew = 0, sumOld = 0;
-                for (int i = 0; i < a.length; i += 7) {
-                  sumNew += a[i];
-                  sumOld += old[i];
-                }
-                final areaNew = sumNew / (a.length / 7);
-                final areaOld = sumOld / (a.length / 7);
-                double w = 0.65; // 常规
-                if (_motion > 0.10) {
-                  w = 0.85; // 动得快 → 跟手，减少拖影
-                } else if (_motion < 0.03) {
-                  w = 0.55; // 基本不动 → 更稳，不乱抖
-                  if (areaOld > 0.02 &&
-                      (areaNew > areaOld * 1.9 || areaNew < areaOld * 0.55)) {
-                    w = 0.25; // 静止却整块忽大忽小 = 这一帧跑偏，别当真
-                    DiagLog.instance.log('SEG',
-                        'alpha 异常帧被抑制（面积 $areaOld→$areaNew 运动$_motion）');
+                final pg = _prevReqGray, cg = _grayReq;
+                final usePix = pg != null &&
+                    cg != null &&
+                    pg.length == cg.length &&
+                    _grayW > 0;
+                if (usePix) {
+                  var sumW = 0.0;
+                  for (int j = 0; j < ih; j++) {
+                    final gRow = (j >> 1) * _grayW;
+                    final aRow = j * iw;
+                    for (int i = 0; i < iw; i++) {
+                      final gx = i >> 1;
+                      final d = (cg[gRow + gx] - pg[gRow + gx]).abs();
+                      var wp = 0.55 + d / 45.0; // 差 27 灰阶以上就完全信新帧
+                      if (wp > 1) wp = 1;
+                      final o = aRow + i;
+                      a[o] = a[o] * wp + old[o] * (1 - wp);
+                      sumW += wp;
+                    }
                   }
-                }
-                _emaW = w;
-                for (int i = 0; i < a.length; i++) {
-                  a[i] = a[i] * w + old[i] * (1 - w);
+                  _emaW = sumW / a.length; // 诊断：平均权重
+                } else {
+                  // 拿不到灰度参照（首帧等）→ 退回保守的固定权重
+                  _emaW = 0.7;
+                  for (int i = 0; i < a.length; i++) {
+                    a[i] = a[i] * 0.7 + old[i] * 0.3;
+                  }
                 }
               }
               _prevAlpha = a;
@@ -1808,7 +1824,10 @@ Uint8List _largestComponent(Uint8List bin, int w, int h) {
   for (final s in sizes) {
     if (s > maxSize) maxSize = s;
   }
-  final keepMin = (maxSize * 0.35).round();
+  // ★阈值从 0.35 放宽到 0.12：举手时手可能和身体**分成两块**，
+  //   原来要求"至少是最大块的 35%"会把手整只扔掉（真机实测：手掌凭空消失）。
+  //   0.12 仍能过滤掉鼠标/桌面那类小误判块。
+  final keepMin = (maxSize * 0.12).round();
   final out = Uint8List(n);
   for (int p = 0; p < n; p++) {
     final l = label[p];
