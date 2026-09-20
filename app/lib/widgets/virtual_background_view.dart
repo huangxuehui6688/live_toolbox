@@ -132,6 +132,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   final Float32List _flowTmp = Float32List(2);
   int _flowMs = 0;
   String _flowDbg = '';
+  String _dispDbg = ''; // 显示几何（帧尺寸/朝向/显示旋转/视图尺寸）——排障一眼看
   double _emaW = 0.65; // 本帧采用的平滑权重（排障可见）
   ui.Image? _frame;
   bool _busy = false;
@@ -735,8 +736,17 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
   Widget _frameImageLayer(bool mirror) {
     final img = _frame;
     if (img == null) return const SizedBox.shrink();
-    // ★帧是**传感器横版**（如 1280×720），要按传感器朝向转正后再铺满
-    final turns = ((360 - _frameOrientation) % 360) ~/ 90;
+    // ★帧是**传感器横版**（如 1280×720），要按传感器朝向转正后再铺满。
+    //
+    // ★★★ 这里必须用 `朝向 ÷ 90`，**不能**用 `((360-朝向)%360) ÷ 90`。
+    //   两个"90°"不是一回事：
+    //     · 采样的 rotDeg = "要转多少度才是正的"（按坐标取反定义，见 _sampleSquareRgb）；
+    //     · RotatedBox 的 quarterTurns = 绕**盒中心**做 rotateZ(q*90°)，是另一个约定。
+    //   两者对 90°/270° 恰好差 **180°**。用错的后果不是"偏一点"，而是
+    //   **整个预览上下颠倒** —— 于是遮罩（按帧算的、正确）和画面（倒的）永远对不上：
+    //   人身上露出背景、背景里又被抠掉一块，怎么调边缘都没用。
+    //   真机实测取证：把"模型看到的画面"转 180° 再按 cover 裁切，与实际显示**逐像素吻合**。
+    final turns = (_frameOrientation ~/ 90) % 4;
     Widget p = RotatedBox(
       quarterTurns: turns % 4,
       child: RawImage(image: img, fit: BoxFit.fill),
@@ -1190,6 +1200,15 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
 
   @override
   Widget build(BuildContext context) {
+    if (kDiagLogOn && _hasFrame) {
+      final vs = MediaQuery.sizeOf(context);
+      _dispDbg = '几何 帧${_frameSize.width.toInt()}x${_frameSize.height.toInt()}'
+          ' img${_frame?.width}x${_frame?.height}'
+          ' 朝向$_frameOrientation 显示转${((_frameOrientation ~/ 90) % 4) * 90}°'
+          ' 镜像${widget.mirror && _frameMirror ? 1 : 0}'
+          ' 视图${vs.width.toInt()}x${vs.height.toInt()}'
+          ' 输入${_aiInW}x$_aiInH';
+    }
     // 色布模式仍走 CPU 色键（遮罩那套只服务 AI 抠像）
     final onGpu = kGpuComposite && _camera != null &&
         _camera!.value.isInitialized && !(widget.keyColor >= 0);
@@ -1209,7 +1228,7 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
               borderRadius: BorderRadius.circular(12),
             ),
             child: Text(
-              '${!_hasFrame ? _status : '$_status · ${_fps.toStringAsFixed(0)}fps'}${_maskDbg.isEmpty ? '' : '\n$_maskDbg'}${_perfDbg.isEmpty ? '' : '\n$_perfDbg'}',
+              '${!_hasFrame ? _status : '$_status · ${_fps.toStringAsFixed(0)}fps'}${_maskDbg.isEmpty ? '' : '\n$_maskDbg'}${_perfDbg.isEmpty ? '' : '\n$_perfDbg'}${_dispDbg.isEmpty ? '' : '\n$_dispDbg'}',
               style: const TextStyle(color: Colors.white, fontSize: 11),
             ),
           ),
