@@ -43,9 +43,22 @@ const bool kDiagOverlayInput = false;
 /// 叠加时同时画"镜像后"的那一套（绿色），用于一眼判断该用哪套映射。
 const bool kDiagOverlayBoth = true;
 
-/// 遮罩小图的长边像素。256 → 384：边界更细。
-/// （模型本身只有 192×352，再加没有新信息，只让放大更平滑、台阶更小）
-const int kMaskLong = 384;
+/// 遮罩小图的长边像素。256 → 384 → **512**：边界更细。
+/// （模型输出本身只有 192~384 宽，这里再大没有"新信息"，只是让最后一次
+///   双线性放大更平滑、台阶更小 —— 毕竟它要铺到 1300+ 物理像素上屏。）
+const int kMaskLong = 512;
+
+/// ★Alpha 边缘收紧的两个膝点（作用在「强度映射之后」的 0~1 值上）。
+///
+/// 为什么需要：模型输出 alpha 的边缘本来就是一条**几像素宽的软坡**，再经
+/// 遮罩图双线性放大、又铺到 1300+ 物理像素 → 屏幕上是一圈十几像素的半透明
+/// "糊边"，肉眼读作"不清晰、脏"。这里把 [Lo, Hi] 这段坡拉伸到满量程：
+/// **同样的空间距离里走完 0→1**，梯度变陡 → 边缘收紧变实（外加速度 smoothstep）。
+///
+/// 调法：想更利落 → 把 Lo 调大 / Hi 调小（坡更窄）；想保发丝等半透明细节 →
+/// 把 span 调大（Lo 调小、Hi 调大）。太激进会把发丝啃掉，别一次调太多。
+const double kAlphaEdgeLo = 0.24;
+const double kAlphaEdgeHi = 0.76;
 
 /// ★出画帧的宽度（采集帧会缩放到这个宽度）。1280（≈720p）是画质与耗时的平衡点：
 /// 显示与模型都吃这一张，几何按构造一致，不再依赖"相机预览纹理"的任何假设。
@@ -464,6 +477,11 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
       if (ok) {
         _engine = e;
         _loadFails = 0;
+        // ★以引擎最终定的尺寸为准：挂上 NPU/XNNPACK 后引擎会自动往上试更大
+        //   的输入（边缘更细）。采样(1084)与推理(1072)本来就读 eng.inputW/H，
+        //   这里把本地副本同步过来，免得 HUD/日志里显示的还是旧值。
+        _aiInW = e.inputW;
+        _aiInH = e.inputH;
         // ★以引擎回报的尺寸为准：只有真拿到非方形输入，才能走"整幅缩放"
         gFullFrameInput = kFullFrameInput && e.inputW != e.inputH;
         DiagLog.instance.log('SEG',
@@ -1016,7 +1034,8 @@ class _VirtualBackgroundViewState extends State<VirtualBackgroundView> {
         'AI ${aw}x$ah 背景${(bg * 100 / n).round()}% '
         '均值${(sum / n).toStringAsFixed(2)} '
         '最低${mn.toStringAsFixed(2)} 最高${mx.toStringAsFixed(2)}'
-        '${_dilateDbg ? ' 涨边+1' : ''}';
+        '${_dilateDbg ? ' 涨边+1' : ''}'
+        '${_engine != null && _engine!.lastInferMs > 0 ? ' 推${_engine!.lastInferMs}ms' : ''}';
   }
 
   Future<void> _onFrame(
@@ -1941,6 +1960,18 @@ Float32List shapeAlpha(Float32List alpha, int aw, int ah, double strength) {
     for (int p = 0; p < n; p++) {
       final v = (blurred[p] - lo) / span;
       blurred[p] = v <= 0 ? 0.0 : (v >= 1 ? 1.0 : v);
+    }
+  }
+
+  // ---- ⑤ ★边缘收紧：这是"看着清不清晰"最直接的一步（见 kAlphaEdgeLo 说明）----
+  // 注意 ④ 只做截断，软坡还在；这里才把坡压窄、梯度拉陡。
+  final el = kAlphaEdgeLo;
+  final es = kAlphaEdgeHi - kAlphaEdgeLo;
+  if (es > 0) {
+    for (int p = 0; p < n; p++) {
+      var v = (blurred[p] - el) / es;
+      v = v <= 0 ? 0.0 : (v >= 1 ? 1.0 : v);
+      blurred[p] = v * v * (3.0 - 2.0 * v); // smoothstep：过渡带内部也更快
     }
   }
 

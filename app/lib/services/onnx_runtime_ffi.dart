@@ -56,6 +56,7 @@ const int _iReleaseValue = 96;
 const int _iReleaseSessionOptions = 100;
 const int _iGetAvailableProviders = 125;
 const int _iReleaseAvailableProviders = 126;
+const int _iAddFreeDimensionOverrideByName = 124;
 const int _iSessionOptionsAppendExecutionProvider = 216;
 
 // OrtApiBase 成员顺序：GetApi(0), GetVersionString(1)
@@ -119,6 +120,10 @@ typedef _NVoidA = Void Function(Pointer<Void>);
 typedef _NVoidAI = Void Function(Pointer<Void>, Int32);
 typedef _NVoidAA = Void Function(Pointer<Void>, Pointer<Void>);
 
+/// int64 形参的 Status 函数（AddFreeDimensionOverrideByName）
+typedef _NStatusAI64 = Pointer<Void> Function(
+    Pointer<Void>, Pointer<Uint8>, Int64);
+
 // ---------------------------------------------------- 函数指针签名（Dart 侧）
 typedef _DGetApi = Pointer<Void> Function(int);
 typedef _DGetVersion = Pointer<Uint8> Function();
@@ -159,6 +164,8 @@ typedef _DStatusProviders =
 typedef _DVoidA = void Function(Pointer<Void>);
 typedef _DVoidAI = void Function(Pointer<Void>, int);
 typedef _DVoidAA = void Function(Pointer<Void>, Pointer<Void>);
+typedef _DStatusAI64 = Pointer<Void> Function(
+    Pointer<Void>, Pointer<Uint8>, int);
 
 // ------------------------------------------------------------------ 内存与字符串
 final DynamicLibrary _libc = DynamicLibrary.process();
@@ -283,6 +290,10 @@ _DStr _dStr(Pointer<Pointer<Void>> api, int idx) =>
 _DInt32 _dInt32(Pointer<Pointer<Void>> api, int idx) =>
     Pointer<NativeFunction<_NInt32>>.fromAddress(api[idx].address)
         .asFunction<_DInt32>();
+
+_DStatusAI64 _dStatusAI64(Pointer<Pointer<Void>> api, int idx) =>
+    Pointer<NativeFunction<_NStatusAI64>>.fromAddress(api[idx].address)
+        .asFunction<_DStatusAI64>();
 
 _DStatusProviders _dStatusProviders(Pointer<Pointer<Void>> api, int idx) =>
     Pointer<NativeFunction<_NStatusProviders>>.fromAddress(api[idx].address)
@@ -425,6 +436,12 @@ class OrtSession {
       return p;
     }
 
+    /// 静默释放一个 Status（用于"可以失败"的调用，比如钉动态轴时名字对不上）。
+    /// ★不能走 takeErr：那会把 lastOpenError 写成"失败"，误导上层重试。
+    void dropErr(Pointer<Void> st) {
+      if (st != nullptr) _dVoidA(api, _iReleaseStatus)(st);
+    }
+
     String takeErr(Pointer<Void> st) {
       if (st == nullptr) return '';
       final code = _dInt32(api, _iGetErrorCode)(st);
@@ -462,20 +479,68 @@ class OrtSession {
       _dStatusA(api, _iEnableCpuMemArena)(opts);
       _dStatusA(api, _iEnableMemPattern)(opts);
 
-      // 按 preferProvider 名字挂执行提供器：'NNAPI'（NPU/GPU 加速，手机上若
-      // 编译进了 NnapiExecutionProvider 就能吃上硬件算力）、'XNNPACK'（优化 CPU）。
-      // ORT 里没编进去/名字不对时这里返回错误，静默回落 CPU —— 上层据此判断。
+      // 按 preferProvider 挂执行提供器：'NNAPI'（NPU/GPU 加速）、'XNNPACK'（ARM
+      // 向量优化）、'CPU'（不挂任何 EP，走 ORT 默认 CPU）。
+      // ★挂不上时**直接返回 null**（由上层换组合），不再静默回落 CPU —— 详见下面。
       var provider = 'CPUExecutionProvider';
-      tmpCStr = ortCStr(preferProvider);
-      final stEp = _dStatusEp(
-          api, _iSessionOptionsAppendExecutionProvider)(
-          opts, tmpCStr, nullptr, nullptr, 0);
-      ortFree(tmpCStr);
-      tmpCStr = nullptr;
-      if (stEp == nullptr) {
-        provider = '${preferProvider}ExecutionProvider';
-      } else {
-        takeErr(stEp);
+      // ---- ★运行时枚举执行提供器（决定性诊断 + 修复挂载）----
+      // 以前直接把 'NNAPI' / 'XNNPACK' 交给 AppendExecutionProvider，**一直失败**
+      // （HUD 上永远是 CPUExecutionProvider）→ 全程白跑纯 CPU，这也是"抠像不如
+      // 别家清晰"的根：CPU 根本算不动更高分辨率的输入。
+      // 不同 ORT 版本对名字写法要求不一（'NNAPI' / 'NnapiExecutionProvider' / 大小写），
+      // 所以这里不猜：先问运行时"你到底注册了哪些"，再按**真实注册名**挂。
+      final avail = _listProviders(api);
+      lastProviders = avail;
+      if (preferProvider.toUpperCase() != 'CPU') {
+        final want = preferProvider.toLowerCase();
+        final cands = <String>[];
+        for (final n in avail) {
+          if (n.toLowerCase().contains(want)) cands.add(n);
+        }
+        cands.add('${preferProvider}ExecutionProvider');
+        cands.add(preferProvider);
+        final tried = <String>{};
+        for (final name in cands) {
+          if (!tried.add(name)) continue;
+          tmpCStr = ortCStr(name);
+          final st = _dStatusEp(
+              api, _iSessionOptionsAppendExecutionProvider)(
+              opts, tmpCStr, nullptr, nullptr, 0);
+          ortFree(tmpCStr);
+          tmpCStr = nullptr;
+          if (st == nullptr) {
+            provider = name;
+            break;
+          }
+          dropErr(st); // 这个写法不被接受 → 换下一个
+        }
+        if (provider == 'CPUExecutionProvider') {
+          // ★挂不上就**立刻判本次组合失败，不建 session**：
+          //   照旧建下去只会拿到一个纯 CPU 的 session，白白加载一次 25MB 模型、
+          //   还让上层误以为"这组可用"。
+          lastOpenError = '执行提供器 $preferProvider 挂不上（本机可用: '
+              '${avail.isEmpty ? "枚举失败" : avail.join("/")}）';
+          return null;
+        }
+      }
+
+      // ---- ★把动态轴钉死（NNAPI 生效的**必要条件**）----
+      // 硬件 EP 无法为"形状未知"的算子分配资源：模型输入是 [batch,3,height,width]
+      // 符号轴时，它们会整段退回 CPU（挂了等于没挂），有的直接拒绝。
+      // 模型里轴的 dim_param 名实测为 batch / height / width。
+      // 名字对不上时 ORT 只会返回错误 Status，静默丢掉即可（dropErr）。
+      if (preferW != null && preferW > 0 && preferH != null && preferH > 0) {
+        for (final d in <List<Object>>[
+          <Object>['batch', 1],
+          <Object>['height', preferH],
+          <Object>['width', preferW],
+        ]) {
+          tmpCStr = ortCStr(d[0] as String);
+          dropErr(_dStatusAI64(api, _iAddFreeDimensionOverrideByName)(
+              opts, tmpCStr, d[1] as int));
+          ortFree(tmpCStr);
+          tmpCStr = nullptr;
+        }
       }
 
       // ---- Session ----
@@ -804,6 +869,35 @@ class OrtSession {
       _releaseOptsFn(_opts);
       _releaseEnvFn(_env);
     } catch (_) {}
+  }
+
+  /// 最近一次 open() 时**运行时枚举到的执行提供器**（诊断用）。
+  /// ★有的机器其实支持 NPU，只是我们以前把名字挂错了 —— 这份列表就是判据。
+  static List<String> lastProviders = <String>[];
+
+  /// 运行时枚举已注册的执行提供器（open() 内部用；失败返回空表，不抛）。
+  static List<String> _listProviders(Pointer<Pointer<Void>> api) {
+    final out = <String>[];
+    try {
+      final p = ortMalloc(8).cast<Pointer<Pointer<Uint8>>>();
+      final lenP = ortMalloc(4).cast<Int32>();
+      final st = _dStatusProviders(api, _iGetAvailableProviders)(p, lenP);
+      if (st != nullptr) {
+        _dVoidA(api, _iReleaseStatus)(st);
+        ortFree(p);
+        ortFree(lenP);
+        return out;
+      }
+      final arr = p.value;
+      final n = lenP[0];
+      for (int i = 0; i < n; i++) {
+        out.add(_readCStr(arr[i]));
+      }
+      _dVoidAI(api, _iReleaseAvailableProviders)(arr.cast<Void>(), n);
+      ortFree(p);
+      ortFree(lenP);
+    } catch (_) {}
+    return out;
   }
 
   /// 诊断：本机 ORT 实际注册了哪些执行提供器。只应在加载/排障时调一次。

@@ -10,6 +10,18 @@ import 'package:path_provider/path_provider.dart';
 import 'diag_log.dart';
 import 'onnx_runtime_ffi.dart';
 
+/// 挂上硬件加速后，允许的最长单次**纯推理**耗时（ms）。超过就往下退一档尺寸。
+/// 320ms ≈ 3fps 的遮罩刷新率，是「人动起来还能靠运动补偿顶住」的下限。
+const int kAiBudgetMs = 320;
+
+/// 自适应输入尺寸候选（宽×高，都是 32 的倍数、长宽比≈9:16）——**从大到小**试，
+/// 取第一个「跑得进预算」的：越大，遮罩边缘越细（放大到 1300+ 物理像素越不糊）。
+const List<List<int>> kAutoMattingSizes = <List<int>>[
+  <int>[384, 672],
+  <int>[288, 512],
+  <int>[192, 352],
+];
+
 /// MODNet 权重在 assets 里的位置（`assets/models/` 已在 pubspec 里声明，
 /// 所以把 .onnx 丢进去**不需要改 pubspec**）。
 const String kModnetAssetPath = 'assets/models/modnet.onnx';
@@ -44,6 +56,9 @@ abstract class MattingEngine {
   /// 连续错误次数。★**跳帧不算错误**（上一次还没推完就返回 null 是正常节流），
   /// 调用方据此判断"引擎是不是真的坏了"，到阈值才熔断。
   int get errorStreak;
+
+  /// ★最近一次**纯推理**耗时（ms，不含采样与后处理）。0 = 还没跑过。
+  int get lastInferMs;
 
   /// 诊断串（执行提供器 / ORT 版本 / 输入尺寸），只给 HUD 和日志用
   String get diag;
@@ -98,6 +113,9 @@ class ModnetMattingEngine implements MattingEngine {
   String _lastError = '';
 
   @override
+  int lastInferMs = 0;
+
+  @override
   String diag = '';
 
   @override
@@ -114,6 +132,22 @@ class ModnetMattingEngine implements MattingEngine {
 
   bool get isReady => _ready;
 
+  /// 当前挂上的是不是"真硬件/向量加速"（NNAPI=NPU/GPU、XNNPACK=ARM 向量优化）。
+  static bool _isAccel(String p) {
+    final s = p.toLowerCase();
+    return s.contains('nnapi') || s.contains('xnnpack');
+  }
+
+  static int _inWOf(Map<Object?, Object?> r) {
+    final w = (r['w'] as int?) ?? (r['size'] as int?) ?? 512;
+    return w <= 0 ? 512 : w;
+  }
+
+  static int _inHOf(Map<Object?, Object?> r) {
+    final h = (r['h'] as int?) ?? (r['size'] as int?) ?? 512;
+    return h <= 0 ? 512 : h;
+  }
+
   @override
   Future<bool> load() async {
     if (_ready) return true;
@@ -123,10 +157,17 @@ class ModnetMattingEngine implements MattingEngine {
       //    NnapiExecutionProvider）。要求 provider 真挂上，否则 int8 在纯
       //    CPU 上比 fp32 慢 2 倍（实测）→ 直接弃用换下一组。
       // ② fp32 + XNNPACK：现状兜底（纯 CPU 优化）。
-      const attempts = <String, String>{
-        kModnetInt8AssetPath: 'NNAPI',
-        kModnetAssetPath: 'XNNPACK',
-      };
+      // 尝试顺序：加速器（按理论收益）→ CPU 兜底。
+      // ★fp32 排在 int8 前面：int8 只在**真挂上 NNAPI** 时才划算（纯 CPU 上 int8
+      //   比 fp32 慢近一倍，桌面实测），而 fp32 无论挂 NNAPI / XNNPACK 都不吃亏，
+      //   而且 fp32 的遮罩质量明显更稳（int8 在发丝/眼镜边会掉细节）。
+      // ★'CPU' 是兜底：不挂任何 EP，用 ORT 默认的 CPU。
+      const attempts = <List<String>>[
+        <String>[kModnetAssetPath, 'NNAPI'],
+        <String>[kModnetInt8AssetPath, 'NNAPI'],
+        <String>[kModnetAssetPath, 'XNNPACK'],
+        <String>[kModnetAssetPath, 'CPU'],
+      ];
       final rp = ReceivePort();
       _rsp = rp;
       final portReady = Completer<SendPort>();
@@ -141,12 +182,27 @@ class ModnetMattingEngine implements MattingEngine {
       _cmd = await portReady.future.timeout(const Duration(seconds: 10));
       DiagLog.instance.log('MATTING', '推理 isolate 就绪');
 
-      for (final entry in attempts.entries) {
-        final path = await _ensureModelFile(entry.key);
+      // ★先枚举一次运行时注册的执行提供器，用来**剪枝**：
+      //   本机没注册的加速器直接跳过 —— 否则 4 组依次试（每组都要加载 25MB 模型、
+      //   还可能各等一次 90s 超时），很容易把外层 45s 的加载超时耗光，
+      //   现场表现就是「AI 一直不出来」。
+      final rtProvs = OrtSession.availableProviders();
+      OrtSession.lastProviders = rtProvs;
+      DiagLog.instance.log('MATTING', '运行时执行提供器: ${rtProvs.join("/")}');
+
+      for (final entry in attempts) {
+        if (entry[1] != 'CPU' && rtProvs.isNotEmpty) {
+          final w = entry[1].toLowerCase();
+          if (!rtProvs.any((n) => n.toLowerCase().contains(w))) {
+            DiagLog.instance.log('MATTING', '跳过 ${entry[1]}：运行时未注册');
+            continue;
+          }
+        }
+        final path = await _ensureModelFile(entry[0]);
         DiagLog.instance.log('MATTING',
-            '尝试 ${entry.key}（provider=${entry.value}）→ ${path ?? "模型落盘失败"}');
+            '尝试 ${entry[0]}（provider=${entry[1]}）→ ${path ?? "模型落盘失败"}');
         if (path == null) {
-          _lastError = '模型资产落盘失败: ${entry.key}';
+          _lastError = '模型资产落盘失败: ${entry[0]}';
           continue;
         }
         final r = await _send(<String, Object?>{
@@ -157,7 +213,7 @@ class ModnetMattingEngine implements MattingEngine {
           'size': preferSize,
           'iw': preferW,
           'ih': preferH,
-          'provider': entry.value,
+          'provider': entry[1],
         }, const Duration(seconds: 90));
         if (r == null) {
           _lastError = 'load 超时/无响应（90s）';
@@ -171,17 +227,57 @@ class ModnetMattingEngine implements MattingEngine {
         }
         final active = (r['provider'] as String?) ?? '';
         final gotNnapi = active.toLowerCase().contains('nnapi');
-        if (entry.key == kModnetInt8AssetPath && !gotNnapi) {
+        if (entry[0] == kModnetInt8AssetPath && !gotNnapi) {
           // NNAPI 没吃上 → int8 留在 CPU 太慢，worker 会重建 session 换模型
           DiagLog.instance.log('MATTING', 'NNAPI 未生效（$active），弃用 int8');
           continue;
         }
-        _inputH = (r['h'] as int?) ?? (r['size'] as int?) ?? 512;
-        _inputW = (r['w'] as int?) ?? (r['size'] as int?) ?? 512;
-        if (_inputH <= 0) _inputH = 512;
-        if (_inputW <= 0) _inputW = 512;
-        final model = entry.key == kModnetInt8AssetPath ? 'int8' : 'fp32';
-        diag = '$active · $model · ${_inputW}x$_inputH';
+        var pickedW = _inWOf(r);
+        var pickedH = _inHOf(r);
+
+        // ---- ★自适应输入尺寸（只在**真挂上硬件加速**时才做）----
+        // "抠像看着不清晰"的头号来源就是模型输入太小：192 宽 → 遮罩的有效边缘
+        // 分辨率只有 192px，铺到 1300+ 物理像素的屏幕上必然是一圈糊边。
+        // 但纯 CPU 上放大就是自杀（192 宽都要 350ms/次）—— **先挂上 NPU/XNNPACK，
+        // 才有资格放大**。这里用"真实推理计时"从大到小阶梯试探，而不是拍一个尺寸：
+        // 拍大了直接掉到 1fps，拍小了白瞎了硬件。
+        if (_isAccel(active)) {
+          for (final c in kAutoMattingSizes) {
+            final lr = await _send(<String, Object?>{
+              'cmd': 'load',
+              'id': _seq++,
+              'path': path,
+              'threads': threads,
+              'size': c[1],
+              'iw': c[0],
+              'ih': c[1],
+              'provider': entry[1],
+            }, const Duration(seconds: 90));
+            // 重建失败（该尺寸硬件不吃 / 超时）→ 保留上一个成功尺寸
+            if (lr == null || lr['ok'] != true) break;
+            final br = await _send(<String, Object?>{
+              'cmd': 'bench',
+              'id': _seq++,
+              'w': c[0],
+              'h': c[1],
+            }, const Duration(seconds: 60));
+            final ms = (br?['ms'] as int?) ?? -1;
+            DiagLog.instance.log(
+                'MATTING', '自适应尺寸 ${c[0]}x${c[1]} → ${ms}ms（预算 $kAiBudgetMs）');
+            if (ms <= 0) break; // 测不出来 → 别乱改
+            pickedW = c[0];
+            pickedH = c[1];
+            if (ms <= kAiBudgetMs) break; // 跑得动 → 就它
+          }
+        }
+        _inputW = pickedW;
+        _inputH = pickedH;
+        final model = entry[0] == kModnetInt8AssetPath ? 'int8' : 'fp32';
+        // ★没挂上加速时，把"本机到底注册了哪些提供器"直接写进 HUD ——
+        //   一张截图就能判定「这机器有没有 NPU 可走」，不用再猜。
+        final provs = (r['providers'] as List?)?.join('/') ?? '';
+        diag = '$active · $model · ${_inputW}x$_inputH'
+            '${_isAccel(active) ? '' : ' · 可用[$provs]'}';
         _ready = true;
         DiagLog.instance.log('MATTING', 'MODNet 就绪：$diag');
         return true;
@@ -234,6 +330,8 @@ class ModnetMattingEngine implements MattingEngine {
       }
       _errStreak = 0;
       _lastError = '';
+      final tm = r?['tMs'];
+      if (tm is int && tm > 0) lastInferMs = tm;
       return a;
     } catch (e) {
       _lastError = '推理取回失败: $e';
@@ -366,14 +464,46 @@ Future<void> _modnetWorker(SendPort replyPort) async {
           replyPort.send(<String, Object?>{'id': id});
           continue;
         }
+        final t0r = DateTime.now();
         _fillInput(s, msg['rgb'] as Uint8List, msg['w'] as int, msg['h'] as int);
         final alpha = s.run();
+        final tMs = DateTime.now().difference(t0r).inMilliseconds;
         replyPort.send(<String, Object?>{
           'id': id,
           'alpha': alpha,
           'err': alpha == null ? s.lastError : null,
           'in': '${s.inputW}x${s.inputH}',
           'outN': s.outputElementCount,
+          'tMs': tMs,
+        });
+      } else if (cmd == 'bench') {
+        // 只服务"开播前自适应尺寸"：拿纯色假图跑 2 次，取**较小**耗时。
+        // ★必须取两次的较小值：第 1 次往往包含图优化/硬件编译（NNAPI 尤其慢），
+        //   拿第一次的耗时会误判成"这个尺寸跑不动"，从而白白退到小尺寸。
+        final s = sess;
+        final bw = msg['w'] as int;
+        final bh = msg['h'] as int;
+        final dummy = Uint8List(bw * bh * 3);
+        var best = -1;
+        var err = '';
+        if (s != null) {
+          for (int k = 0; k < 2; k++) {
+            final t0b = DateTime.now();
+            _fillInput(s, dummy, bw, bh);
+            final ab = s.run();
+            final ms = DateTime.now().difference(t0b).inMilliseconds;
+            if (ab == null) {
+              err = s.lastError;
+              break;
+            }
+            if (best < 0 || ms < best) best = ms;
+          }
+        }
+        replyPort.send(<String, Object?>{
+          'id': id,
+          'ok': best >= 0,
+          'ms': best,
+          'err': err,
         });
       } else if (cmd == 'dispose') {
         sess?.dispose();
